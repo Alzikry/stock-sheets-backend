@@ -13,4 +13,4 @@ COPY . .
 
 EXPOSE 4000
 
-CMD ["node", "src/index.js"]
+CMD mkdir -p credentials && echo "$GOOGLE_CREDENTIALS_JSON" > credentials/service-account-key.json && node src/index.js

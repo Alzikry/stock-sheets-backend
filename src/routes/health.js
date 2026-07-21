@@ -16,6 +16,8 @@ router.get('/', async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
+    // Log detail error lengkap untuk debugging (sementara)
+    console.error('DETAIL ERROR LENGKAP:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
     res.status(500).json({
       status: 'error',
       server: 'running',

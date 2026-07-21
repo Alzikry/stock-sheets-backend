@@ -1,0 +1,105 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================
+// Product — data master produk (Code Material)
+// Sumber: kolom B, C, D di tab "Stock In/Out Summary"
+// Urutan baris di sheet dipakai untuk matching antar tab,
+// tapi di database kita simpan by "code" (nama item) sebagai kunci unik.
+// ============================================
+model Product {
+  id        String   @id @default(cuid())
+  code      String   @unique // contoh: "Stand Fan 1681" (kolom B / "Item")
+  pcsPerKoli Int     // isi per koli, contoh: 2 (kolom C)
+  kategori  String?  // contoh: "Kipas" (kolom D)
+  rowOrder  Int      // posisi baris asli di spreadsheet, untuk matching Summary <-> Retur
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stockSummaries    StockSummary[]
+  dailyStockEntries StockDailyEntry[]
+  dailyReturEntries ReturDailyEntry[]
+}
+
+// ============================================
+// StockSummary — satu baris ringkasan per produk per periode sync
+// Ini representasi "state saat ini" hasil hitung terakhir
+// ============================================
+model StockSummary {
+  id              String   @id @default(cuid())
+  product         Product  @relation(fields: [productId], references: [id])
+  productId       String
+
+  periodLabel     String   // contoh: "2026-07" (tahun-bulan, sesuai sheet aktif)
+  stockHandKoli   Decimal  // Stock Hand awal (kolom E), satuan koli
+  totalInKoli     Decimal  // total In sepanjang periode, satuan koli
+  totalOutKoli    Decimal  // total Out sepanjang periode, satuan koli
+  totalReturKoli  Decimal  // total Retur sepanjang periode, satuan koli
+
+  endStockKoli    Decimal  // Stock Hand + totalIn - totalOut (belum + retur)
+  endStockPcs     Decimal  // endStockKoli * pcsPerKoli (tampilan pcs, jalur terpisah)
+  stockCountFinal Decimal  // endStockKoli + totalReturKoli (RETUR + STOCK AKHIR, satuan koli)
+
+  lastSyncedAt    DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([productId, periodLabel]) // satu produk cuma punya 1 summary aktif per periode
+}
+
+// ============================================
+// StockDailyEntry — riwayat In/Out harian per produk
+// Sumber: pasangan kolom In/Out per tanggal di tab "Stock In/Out Summary"
+// ============================================
+model StockDailyEntry {
+  id        String   @id @default(cuid())
+  product   Product  @relation(fields: [productId], references: [id])
+  productId String
+
+  date      DateTime // tanggal transaksi, contoh: 2026-07-13
+  inKoli    Decimal  @default(0)
+  outKoli   Decimal  @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([productId, date]) // satu produk cuma punya 1 baris per tanggal
+}
+
+// ============================================
+// ReturDailyEntry — riwayat Retur harian per produk
+// Sumber: kolom tanggal (In) di tab "Stock Retur"
+// ============================================
+model ReturDailyEntry {
+  id        String   @id @default(cuid())
+  product   Product  @relation(fields: [productId], references: [id])
+  productId String
+
+  date      DateTime // tanggal retur
+  returKoli Decimal  @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([productId, date])
+}
+
+// ============================================
+// SyncLog — catatan riwayat setiap kali sync dijalankan
+// Berguna untuk menampilkan "terakhir sync: ..." di dashboard
+// dan untuk debugging jika ada sync yang gagal
+// ============================================
+model SyncLog {
+  id           String   @id @default(cuid())
+  startedAt    DateTime @default(now())
+  finishedAt   DateTime?
+  status       String   // "success" | "failed" | "running"
+  triggeredBy  String   // "schedule" | "manual"
+  rowsSynced   Int?
+  errorMessage String?
+}

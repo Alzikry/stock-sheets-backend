@@ -8,7 +8,6 @@ const cors = require('cors');
 const healthRoute = require('./routes/health');
 const syncRoute = require('./routes/sync');
 const productsRoute = require('./routes/products');
-const { startScheduler } = require('./services/scheduler');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -25,7 +24,12 @@ app.get('/', (req, res) => {
   res.json({ message: 'Stock Sheets Viewer API is running' });
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Server berjalan di http://localhost:${PORT}`);
-  startScheduler();
-});
+// Hanya jalankan server lokal kalau BUKAN di Vercel
+// (Vercel jalankan app ini lewat serverless function, bukan app.listen)
+if (process.env.VERCEL !== '1') {
+  app.listen(PORT, () => {
+    console.log(`✅ Server berjalan di http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;

@@ -25,6 +25,7 @@ model Product {
   stockSummaries    StockSummary[]
   dailyStockEntries StockDailyEntry[]
   dailyReturEntries ReturDailyEntry[]
+  opnameSessions    StockOpnameSession[]
 }
 
 // ============================================
@@ -102,4 +103,61 @@ model SyncLog {
   triggeredBy  String   // "schedule" | "manual"
   rowsSynced   Int?
   errorMessage String?
+}
+
+// ============================================
+// StockOpnameSession — satu sesi opname untuk 1 produk di 1 periode.
+// Bisa punya banyak StockOpnamePartial di dalamnya (hasil hitung dari
+// beberapa orang/lokasi berbeda), yang dijumlahkan jadi total.
+// Setelah di-approve final (status "final"), sesi ini terkunci: tidak
+// bisa lagi ditambah/diedit/dihapus partial-nya.
+// ============================================
+model StockOpnameSession {
+  id        String   @id @default(cuid())
+  product   Product  @relation(fields: [productId], references: [id])
+  productId String
+
+  periodLabel String // contoh: "2026-07", sama seperti StockSummary
+
+  // Snapshot stockCountFinal dari StockSummary SAAT SESI INI DIBUAT
+  // PERTAMA KALI (bukan dihitung ulang tiap saat) -- supaya kalau ada
+  // sync baru di tengah proses opname, angka pembanding tidak berubah
+  // sendiri di tengah jalan.
+  systemKoli Decimal
+
+  status String @default("open") // "open" | "final"
+
+  // Diisi HANYA saat approve final (snapshot, bukan live-computed):
+  finalCountedKoli Decimal? // total akumulasi semua partial saat di-approve
+  selisihKoli      Decimal? // finalCountedKoli - systemKoli
+  finalizedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  partials StockOpnamePartial[]
+
+  // Catatan: SENGAJA TIDAK diberi @@unique([productId, periodLabel]),
+  // karena boleh ada lebih dari satu sesi utk produk+periode yang sama
+  // (misal sesi lama sudah "final", lalu user mau opname ulang -> sesi
+  // baru dengan status "open" dibuat lagi). Query yang cari "sesi open
+  // aktif" harus filter status = "open" secara eksplisit di kode.
+}
+
+// ============================================
+// StockOpnamePartial — satu input hitung manual dari satu orang/lokasi,
+// menjadi bagian dari StockOpnameSession. Total sesi = SUM semua partial
+// yang terhubung ke sesi itu.
+// ============================================
+model StockOpnamePartial {
+  id        String              @id @default(cuid())
+  session   StockOpnameSession  @relation(fields: [sessionId], references: [id])
+  sessionId String
+
+  countedKoli Decimal // hasil hitung manual orang ini, SUDAH dikonversi ke koli
+  note        String? // opsional, misal "gudang B" atau "rak belakang"
+  countedBy   String? // opsional, belum ada sistem auth
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

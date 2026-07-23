@@ -8,6 +8,7 @@ const cors = require('cors');
 const healthRoute = require('./routes/health');
 const syncRoute = require('./routes/sync');
 const productsRoute = require('./routes/products');
+const opnameRoute = require('./routes/opname');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -19,6 +20,7 @@ app.use(express.json());
 app.use('/api/health', healthRoute);
 app.use('/api/sync', syncRoute);
 app.use('/api/products', productsRoute);
+app.use('/api/opname', opnameRoute);
 
 app.get('/', (req, res) => {
   res.json({ message: 'Stock Sheets Viewer API is running' });

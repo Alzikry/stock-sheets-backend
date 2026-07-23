@@ -25,7 +25,7 @@ model Product {
   stockSummaries    StockSummary[]
   dailyStockEntries StockDailyEntry[]
   dailyReturEntries ReturDailyEntry[]
-  opnameSessions    StockOpnameSession[]
+  opnameItems       StockOpnameItem[]
 }
 
 // ============================================
@@ -106,57 +106,89 @@ model SyncLog {
 }
 
 // ============================================
-// StockOpnameSession — satu sesi opname untuk 1 produk di 1 periode.
-// Bisa punya banyak StockOpnamePartial di dalamnya (hasil hitung dari
-// beberapa orang/lokasi berbeda), yang dijumlahkan jadi total.
-// Setelah di-approve final (status "final"), sesi ini terkunci: tidak
-// bisa lagi ditambah/diedit/dihapus partial-nya.
+// STOCK OPNAME v2 — REDESIGN TOTAL (Sesi #7)
+// Model lama (StockOpnameSession per-produk + StockOpnamePartial) dari
+// Sesi #6 DIHAPUS TOTAL dan digantikan struktur 3-level di bawah ini:
+//
+//   StockOpnameSession (1 sesi opname, bisa cakup BANYAK produk)
+//         |
+//         v
+//   StockOpnameItem (1 produk di dalam sesi itu, snapshot systemKoli)
+//         |
+//         v
+//   StockOpnameEntry (banyak baris hitungan per produk, dari
+//                      tim/sumber berbeda -- totalnya dijumlah)
+//
+// Alasan redesign: user mau 1 sesi bisa mencakup banyak produk (mirip
+// referensi app "Cycle Count" milik user), TAPI produk ditambahkan
+// manual satu-satu lewat search (BUKAN otomatis semua produk sekaligus).
+// Dan tiap produk dalam sesi bisa dihitung oleh lebih dari satu
+// tim/sumber -- makanya perlu level ke-3 (Entry) untuk baris2 hitungan.
+// ============================================
+
+// ============================================
+// StockOpnameSession — satu sesi opname stock, bisa mencakup banyak
+// produk (lewat StockOpnameItem di bawahnya). Nama sesi auto-generate
+// dari tanggal saat dibuat, format "Stock Opname DD/MM/YY" (dibuat di
+// level aplikasi/backend, bukan default database).
 // ============================================
 model StockOpnameSession {
-  id        String   @id @default(cuid())
-  product   Product  @relation(fields: [productId], references: [id])
-  productId String
+  id     String @id @default(cuid())
+  name   String // contoh: "Stock Opname 23/07/26"
 
-  periodLabel String // contoh: "2026-07", sama seperti StockSummary
+  status String @default("open") // "open" (Berjalan) | "final" (Final)
 
-  // Snapshot stockCountFinal dari StockSummary SAAT SESI INI DIBUAT
-  // PERTAMA KALI (bukan dihitung ulang tiap saat) -- supaya kalau ada
-  // sync baru di tengah proses opname, angka pembanding tidak berubah
-  // sendiri di tengah jalan.
-  systemKoli Decimal
-
-  status String @default("open") // "open" | "final"
-
-  // Diisi HANYA saat approve final (snapshot, bukan live-computed):
-  finalCountedKoli Decimal? // total akumulasi semua partial saat di-approve
-  selisihKoli      Decimal? // finalCountedKoli - systemKoli
-  finalizedAt      DateTime?
+  finalizedAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  partials StockOpnamePartial[]
-
-  // Catatan: SENGAJA TIDAK diberi @@unique([productId, periodLabel]),
-  // karena boleh ada lebih dari satu sesi utk produk+periode yang sama
-  // (misal sesi lama sudah "final", lalu user mau opname ulang -> sesi
-  // baru dengan status "open" dibuat lagi). Query yang cari "sesi open
-  // aktif" harus filter status = "open" secara eksplisit di kode.
+  items StockOpnameItem[]
 }
 
 // ============================================
-// StockOpnamePartial — satu input hitung manual dari satu orang/lokasi,
-// menjadi bagian dari StockOpnameSession. Total sesi = SUM semua partial
-// yang terhubung ke sesi itu.
+// StockOpnameItem — satu produk di dalam satu StockOpnameSession.
+// systemKoli di-snapshot SAAT PRODUK INI DITAMBAHKAN ke sesi (bukan
+// dihitung ulang tiap saat), supaya kalau ada sync baru di tengah
+// proses opname, angka pembanding tidak berubah sendiri.
+//
+// countedKoli TOTAL untuk produk ini TIDAK disimpan sebagai kolom di
+// sini -- selalu dihitung on-the-fly dari SUM semua StockOpnameEntry
+// yang terhubung ke item ini (lihat helper sumEntries() di kode
+// backend). Ini supaya tidak ada 2 sumber kebenaran yang bisa
+// tidak-sinkron (kolom tersimpan vs data entry asli).
 // ============================================
-model StockOpnamePartial {
-  id        String              @id @default(cuid())
-  session   StockOpnameSession  @relation(fields: [sessionId], references: [id])
+model StockOpnameItem {
+  id        String  @id @default(cuid())
+  session   StockOpnameSession @relation(fields: [sessionId], references: [id])
   sessionId String
 
-  countedKoli Decimal // hasil hitung manual orang ini, SUDAH dikonversi ke koli
-  note        String? // opsional, misal "gudang B" atau "rak belakang"
-  countedBy   String? // opsional, belum ada sistem auth
+  product   Product @relation(fields: [productId], references: [id])
+  productId String
+
+  systemKoli Decimal // snapshot StockSummary.stockCountFinal saat item ini ditambahkan
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  entries StockOpnameEntry[]
+
+  @@unique([sessionId, productId]) // 1 produk cuma bisa 1x ditambahkan per sesi (banyak entry di dalamnya, bukan banyak item duplikat)
+}
+
+// ============================================
+// StockOpnameEntry — satu baris hitungan manual untuk 1 produk di dalam
+// 1 sesi. Bisa lebih dari 1 entry per item (misal dihitung oleh tim
+// berbeda), totalnya dijumlah di level aplikasi untuk dapat total per
+// item.
+// ============================================
+model StockOpnameEntry {
+  id     String @id @default(cuid())
+  item   StockOpnameItem @relation(fields: [itemId], references: [id])
+  itemId String
+
+  countedKoli Decimal // hasil hitung manual baris ini, satuan koli
+  note        String? // opsional, misal "hitungan team A"
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -54,6 +54,8 @@ const HELP_TEXT = [
   '/opname - ringkasan sesi Stock Opname yang masih berjalan',
   `/laporan - top ${LAPORAN_TOP_N} volume masuk & keluar (30 hari terakhir)`,
   `/laporan DD-MM-YYYY - laporan untuk tanggal tertentu saja, contoh: /laporan 15-07-2026`,
+  `/masuk DD-MM-YYYY - daftar LENGKAP semua barang masuk pada tanggal itu, contoh: /masuk 15-07-2026`,
+  `/keluar DD-MM-YYYY - daftar LENGKAP semua barang keluar pada tanggal itu, contoh: /keluar 15-07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -179,7 +181,73 @@ async function handleLaporan(arg) {
   ].join('\n');
 }
 
-// ===== Webhook utama =====
+/**
+ * /masuk DD-MM-YYYY -- daftar LENGKAP semua produk yang ada aktivitas
+ * IN pada tanggal tersebut (tanpa batas jumlah, beda dari /laporan yang
+ * cuma top N). WAJIB diisi tanggal, tidak ada default seperti /laporan.
+ */
+async function handleMasuk(arg) {
+  if (!arg) {
+    return 'Format: /masuk DD-MM-YYYY\nContoh: /masuk 15-07-2026';
+  }
+
+  const targetDate = parseCommandDate(arg);
+  if (!targetDate) {
+    return 'Format tanggal salah. Gunakan: /masuk DD-MM-YYYY\nContoh: /masuk 15-07-2026';
+  }
+
+  const start = new Date(targetDate);
+  const end = new Date(targetDate);
+  end.setUTCHours(23, 59, 59, 999);
+
+  const entries = await prisma.stockDailyEntry.findMany({
+    where: { date: { gte: start, lte: end }, inKoli: { gt: 0 } },
+    include: { product: { select: { code: true } } },
+    orderBy: { inKoli: 'desc' },
+  });
+
+  if (entries.length === 0) {
+    return `Tidak ada barang masuk pada tanggal ${arg}.`;
+  }
+
+  const lines = entries.map((e, i) => `${i + 1}. ${e.product.code} - ${fmt(e.inKoli)} koli`);
+
+  return [`📥 Barang Masuk pada ${arg} (${entries.length} produk):`, ...lines].join('\n');
+}
+
+/**
+ * /keluar DD-MM-YYYY -- daftar LENGKAP semua produk yang ada aktivitas
+ * OUT pada tanggal tersebut (tanpa batas jumlah). Sama persis polanya
+ * dengan /masuk, cuma sumber datanya outKoli.
+ */
+async function handleKeluar(arg) {
+  if (!arg) {
+    return 'Format: /keluar DD-MM-YYYY\nContoh: /keluar 15-07-2026';
+  }
+
+  const targetDate = parseCommandDate(arg);
+  if (!targetDate) {
+    return 'Format tanggal salah. Gunakan: /keluar DD-MM-YYYY\nContoh: /keluar 15-07-2026';
+  }
+
+  const start = new Date(targetDate);
+  const end = new Date(targetDate);
+  end.setUTCHours(23, 59, 59, 999);
+
+  const entries = await prisma.stockDailyEntry.findMany({
+    where: { date: { gte: start, lte: end }, outKoli: { gt: 0 } },
+    include: { product: { select: { code: true } } },
+    orderBy: { outKoli: 'desc' },
+  });
+
+  if (entries.length === 0) {
+    return `Tidak ada barang keluar pada tanggal ${arg}.`;
+  }
+
+  const lines = entries.map((e, i) => `${i + 1}. ${e.product.code} - ${fmt(e.outKoli)} koli`);
+
+  return [`📤 Barang Keluar pada ${arg} (${entries.length} produk):`, ...lines].join('\n');
+}
 
 router.post('/webhook', async (req, res) => {
   try {
@@ -225,6 +293,12 @@ router.post('/webhook', async (req, res) => {
         break;
       case '/laporan':
         reply = await handleLaporan(arg);
+        break;
+      case '/masuk':
+        reply = await handleMasuk(arg);
+        break;
+      case '/keluar':
+        reply = await handleKeluar(arg);
         break;
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;

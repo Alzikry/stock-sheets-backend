@@ -8,7 +8,7 @@
 //   /stok <nama produk>  -> cari & tampilkan stok
 //   /sync                -> jalankan sync dari Google Sheets
 //   /opname               -> ringkasan sesi Stock Opname yang masih open
-//   /laporan               -> top 5 volume masuk & keluar, 30 hari terakhir
+//   /laporan               -> top 10 volume masuk & keluar, 30 hari terakhir
 //   /help atau /start      -> daftar command
 //
 // KEAMANAN: hanya chat ID yang cocok dengan TELEGRAM_ALLOWED_CHAT_ID yang
@@ -23,6 +23,12 @@ const { Prisma } = require('@prisma/client');
 const { syncFromSheets } = require('../services/syncService');
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+
+// Jumlah item yang ditampilkan per kategori di /laporan. Sengaja lebih
+// kecil dari versi web (top 30), karena balasan chat Telegram lebih enak
+// dibaca kalau ringkas -- 10 item x 2 kategori (In & Out) sudah cukup
+// padat untuk 1 pesan chat di HP.
+const LAPORAN_TOP_N = 10;
 
 async function sendMessage(chatId, text) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
@@ -46,7 +52,7 @@ const HELP_TEXT = [
   '/stok <nama produk> - cari stok produk',
   '/sync - jalankan sync dari Google Sheets',
   '/opname - ringkasan sesi Stock Opname yang masih berjalan',
-  '/laporan - top 5 volume masuk & keluar (30 hari terakhir)',
+  `/laporan - top ${LAPORAN_TOP_N} volume masuk & keluar (30 hari terakhir)`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -132,14 +138,14 @@ async function handleLaporan() {
   }
 
   const all = Array.from(statsByProduct.values());
-  const topIn = [...all].sort((a, b) => b.totalIn.comparedTo(a.totalIn)).slice(0, 5);
-  const topOut = [...all].sort((a, b) => b.totalOut.comparedTo(a.totalOut)).slice(0, 5);
+  const topIn = [...all].sort((a, b) => b.totalIn.comparedTo(a.totalIn)).slice(0, LAPORAN_TOP_N);
+  const topOut = [...all].sort((a, b) => b.totalOut.comparedTo(a.totalOut)).slice(0, LAPORAN_TOP_N);
 
   return [
-    '📥 Top 5 Volume Masuk (30 hari terakhir):',
+    `📥 Top ${LAPORAN_TOP_N} Volume Masuk (30 hari terakhir):`,
     ...topIn.map((s, i) => `${i + 1}. ${s.code} - ${fmt(s.totalIn)} koli`),
     '',
-    '📤 Top 5 Volume Keluar (30 hari terakhir):',
+    `📤 Top ${LAPORAN_TOP_N} Volume Keluar (30 hari terakhir):`,
     ...topOut.map((s, i) => `${i + 1}. ${s.code} - ${fmt(s.totalOut)} koli`),
   ].join('\n');
 }
@@ -162,7 +168,8 @@ router.post('/webhook', async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // Chat ID tidak cocok -> abaikan diam-diam
+    // Chat ID tidak cocok -> abaikan diam-diam (jangan balas apapun,
+    // supaya tidak membocorkan bahwa bot ini "hidup" ke orang lain)
     if (String(chatId) !== String(allowedChatId)) {
       return res.json({ ok: true });
     }
@@ -198,6 +205,7 @@ router.post('/webhook', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('Telegram webhook error:', err);
+    // Tetap balas 200 ke Telegram supaya tidak retry berulang-ulang
     res.json({ ok: true });
   }
 });

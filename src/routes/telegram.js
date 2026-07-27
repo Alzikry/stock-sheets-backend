@@ -257,17 +257,24 @@ router.post('/webhook', async (req, res) => {
     }
 
     const chatId = message.chat.id;
-    const allowedChatId = process.env.TELEGRAM_ALLOWED_CHAT_ID;
+    // TELEGRAM_ALLOWED_CHAT_ID bisa berisi lebih dari 1 chat ID, dipisah
+    // koma, supaya beberapa orang bisa pakai bot yang sama. Contoh:
+    // TELEGRAM_ALLOWED_CHAT_ID=6591808653,1234567890
+    const allowedChatIdRaw = process.env.TELEGRAM_ALLOWED_CHAT_ID;
+    const allowedChatIds = allowedChatIdRaw
+      ? allowedChatIdRaw.split(',').map((id) => id.trim()).filter(Boolean)
+      : [];
 
     // Mode setup: env var belum diisi -> kasih tau chat ID pengirim
-    if (!allowedChatId) {
-      await sendMessage(chatId, `Chat ID kamu: ${chatId}\n\nSalin ke .env / Vercel env var sebagai TELEGRAM_ALLOWED_CHAT_ID, lalu restart server.`);
+    if (allowedChatIds.length === 0) {
+      await sendMessage(chatId, `Chat ID kamu: ${chatId}\n\nSalin ke .env / Vercel env var sebagai TELEGRAM_ALLOWED_CHAT_ID, lalu restart server.\n\nUntuk beberapa orang sekaligus, pisahkan dengan koma, contoh:\nTELEGRAM_ALLOWED_CHAT_ID=6591808653,1234567890`);
       return res.json({ ok: true });
     }
 
-    // Chat ID tidak cocok -> abaikan diam-diam (jangan balas apapun,
-    // supaya tidak membocorkan bahwa bot ini "hidup" ke orang lain)
-    if (String(chatId) !== String(allowedChatId)) {
+    // Chat ID tidak ada di daftar yang diizinkan -> abaikan diam-diam
+    // (jangan balas apapun, supaya tidak membocorkan bahwa bot ini
+    // "hidup" ke orang lain)
+    if (!allowedChatIds.includes(String(chatId))) {
       return res.json({ ok: true });
     }
 

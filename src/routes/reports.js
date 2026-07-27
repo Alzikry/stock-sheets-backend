@@ -4,9 +4,9 @@
 // yang PUNYA STOK tapi jarang/tidak bergerak (slow-moving stock).
 //
 // Sumber data: StockDailyEntry (riwayat in/out harian per produk),
-// difilter berdasarkan rentang tanggal yang diminta. Untuk kategori
-// "jarang bergerak", digabung dengan StockSummary periode berjalan
-// untuk tahu produk mana yang masih ada stoknya (stockCountFinal > 0).
+// difilter berdasarkan rentang tanggal yang diminta. Semua kategori
+// (bukan cuma slow-moving) juga disandingkan dengan StockSummary
+// periode berjalan untuk menampilkan stok hari ini.
 
 const express = require('express');
 const router = express.Router();
@@ -26,6 +26,9 @@ const TOP_N = 30;
  *   - slowMoving: stockCountFinal > 0 (periode BERJALAN, bukan periode
  *     filter), tapi total in+out dalam periode filter PALING KECIL
  *     (termasuk yang 0 sama sekali)
+ *
+ * Semua kategori sekarang menyertakan stockCountFinal (stok hari ini,
+ * dari periode berjalan), bukan cuma slowMoving.
  */
 router.get('/movement', async (req, res) => {
   try {
@@ -81,50 +84,45 @@ router.get('/movement', async (req, res) => {
 
     const allStats = Array.from(statsByProduct.values());
 
+    // Ambil StockSummary periode BERJALAN (bulan sekarang, bukan periode
+    // filter tanggal) untuk tahu stok hari ini tiap produk. Dipakai untuk
+    // SEMUA kategori sekarang, bukan cuma slowMoving.
+    const currentPeriodLabel = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+    const allSummaries = await prisma.stockSummary.findMany({
+      where: { periodLabel: currentPeriodLabel },
+      select: { productId: true, stockCountFinal: true },
+    });
+    const stockByProduct = new Map(allSummaries.map((s) => [s.productId, s.stockCountFinal]));
+
+    const withStock = (s) => ({
+      productId: s.productId,
+      code: s.code,
+      kategori: s.kategori,
+      totalInKoli: s.totalInKoli,
+      totalOutKoli: s.totalOutKoli,
+      activeDays: s.activeDays,
+      stockCountFinal: stockByProduct.has(s.productId) ? stockByProduct.get(s.productId) : null,
+    });
+
     // ===== Kategori 1: Volume IN tertinggi =====
     const topIn = [...allStats]
       .sort((a, b) => b.totalInKoli.comparedTo(a.totalInKoli))
       .slice(0, TOP_N)
-      .map((s) => ({
-        productId: s.productId,
-        code: s.code,
-        kategori: s.kategori,
-        totalInKoli: s.totalInKoli,
-        totalOutKoli: s.totalOutKoli,
-        activeDays: s.activeDays,
-      }));
+      .map(withStock);
 
     // ===== Kategori 2: Volume OUT tertinggi =====
     const topOut = [...allStats]
       .sort((a, b) => b.totalOutKoli.comparedTo(a.totalOutKoli))
       .slice(0, TOP_N)
-      .map((s) => ({
-        productId: s.productId,
-        code: s.code,
-        kategori: s.kategori,
-        totalInKoli: s.totalInKoli,
-        totalOutKoli: s.totalOutKoli,
-        activeDays: s.activeDays,
-      }));
+      .map(withStock);
 
     // ===== Kategori 3: Frekuensi tersering (hari aktif terbanyak) =====
     const topFrequency = [...allStats]
       .sort((a, b) => b.activeDays - a.activeDays)
       .slice(0, TOP_N)
-      .map((s) => ({
-        productId: s.productId,
-        code: s.code,
-        kategori: s.kategori,
-        totalInKoli: s.totalInKoli,
-        totalOutKoli: s.totalOutKoli,
-        activeDays: s.activeDays,
-      }));
+      .map(withStock);
 
     // ===== Kategori 4: Punya stok tapi jarang/tidak bergerak =====
-    // Ambil StockSummary periode BERJALAN (bulan sekarang, bukan
-    // periode filter tanggal) untuk tahu produk mana yang masih ada
-    // stoknya saat ini.
-    const currentPeriodLabel = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
     const summariesWithStock = await prisma.stockSummary.findMany({
       where: { periodLabel: currentPeriodLabel, stockCountFinal: { gt: 0 } },
       include: { product: { select: { id: true, code: true, kategori: true, pcsPerKoli: true } } },

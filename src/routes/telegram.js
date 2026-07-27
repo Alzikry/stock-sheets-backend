@@ -53,6 +53,7 @@ const HELP_TEXT = [
   '/sync - jalankan sync dari Google Sheets',
   '/opname - ringkasan sesi Stock Opname yang masih berjalan',
   `/laporan - top ${LAPORAN_TOP_N} volume masuk & keluar (30 hari terakhir)`,
+  `/laporan DD-MM-YYYY - laporan untuk tanggal tertentu saja, contoh: /laporan 15-07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -117,10 +118,38 @@ async function handleOpname() {
   ].join('\n');
 }
 
-async function handleLaporan() {
-  const end = new Date();
-  const start = new Date();
-  start.setDate(start.getDate() - 30);
+/**
+ * Parse tanggal format "DD-MM-YYYY" (dipisah strip, sesuai format
+ * command /laporan) jadi objek Date. Return null kalau formatnya salah.
+ */
+function parseCommandDate(dateStr) {
+  const parts = dateStr.trim().split('-');
+  if (parts.length !== 3) return null;
+  const [day, month, year] = parts.map((p) => parseInt(p, 10));
+  if (!day || !month || !year || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+async function handleLaporan(arg) {
+  let start, end, labelPeriode;
+
+  if (arg) {
+    // Mode tanggal spesifik: /laporan 15-07-2026 -> data hari itu saja
+    const targetDate = parseCommandDate(arg);
+    if (!targetDate) {
+      return 'Format tanggal salah. Gunakan: /laporan DD-MM-YYYY\nContoh: /laporan 15-07-2026\n\nAtau /laporan tanpa tanggal untuk 30 hari terakhir.';
+    }
+    start = new Date(targetDate);
+    end = new Date(targetDate);
+    end.setUTCHours(23, 59, 59, 999);
+    labelPeriode = arg;
+  } else {
+    // Mode default: 30 hari terakhir (perilaku lama, tidak berubah)
+    end = new Date();
+    start = new Date();
+    start.setDate(start.getDate() - 30);
+    labelPeriode = '30 hari terakhir';
+  }
 
   const entries = await prisma.stockDailyEntry.findMany({
     where: { date: { gte: start, lte: end } },
@@ -142,10 +171,10 @@ async function handleLaporan() {
   const topOut = [...all].sort((a, b) => b.totalOut.comparedTo(a.totalOut)).slice(0, LAPORAN_TOP_N);
 
   return [
-    `📥 Top ${LAPORAN_TOP_N} Volume Masuk (30 hari terakhir):`,
+    `📥 Top ${LAPORAN_TOP_N} Volume Masuk (${labelPeriode}):`,
     ...topIn.map((s, i) => `${i + 1}. ${s.code} - ${fmt(s.totalIn)} koli`),
     '',
-    `📤 Top ${LAPORAN_TOP_N} Volume Keluar (30 hari terakhir):`,
+    `📤 Top ${LAPORAN_TOP_N} Volume Keluar (${labelPeriode}):`,
     ...topOut.map((s, i) => `${i + 1}. ${s.code} - ${fmt(s.totalOut)} koli`),
   ].join('\n');
 }
@@ -195,7 +224,7 @@ router.post('/webhook', async (req, res) => {
         reply = await handleOpname();
         break;
       case '/laporan':
-        reply = await handleLaporan();
+        reply = await handleLaporan(arg);
         break;
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;

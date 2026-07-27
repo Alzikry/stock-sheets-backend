@@ -30,6 +30,13 @@
 // masih kurang). Solusi permanen: StockSummary (dan Product) sekarang JUGA
 // pakai batch raw SQL, bukan lagi $transaction dengan operasi berurutan.
 // Ini menghapus ketergantungan pada timeout yang terus dinaikkan.
+//
+// CATATAN FIX baris "TOTAL" (ditemukan 27 Juli 2026): tab sumber di Google
+// Sheets ternyata punya baris ringkasan/jumlah (code = "TOTAL") yang ikut
+// kebaca sebagai baris produk biasa. Baris ini BUKAN produk asli, jadi
+// dibuang di sini (lihat filter `cleanResults` di bawah) sebelum diproses
+// lebih lanjut -- baik untuk sync yang akan datang, maupun supaya sync
+// berikutnya tidak menciptakan ulang baris ini di database.
 
 const crypto = require('crypto');
 const prisma = require('../lib/prisma');
@@ -63,7 +70,17 @@ async function syncFromSheets({ spreadsheetId, year, month, triggeredBy = 'manua
     const returData = await readReturSheet(spreadsheetId, year, month);
 
     // 2. Hitung Stock Akhir untuk semua produk
-    const results = calculateAllStock(summaryData, returData);
+    const rawResults = calculateAllStock(summaryData, returData);
+
+    // 2b. Buang baris "ringkasan/jumlah" yang bukan produk asli (misal
+    // baris berjudul "TOTAL" di paling bawah tab Summary), atau baris
+    // dengan code kosong/whitespace saja. Perbandingan tidak peduli
+    // huruf besar/kecil dan spasi di pinggir, supaya "Total", "TOTAL ",
+    // " total" dsb tetap kebuang.
+    const results = rawResults.filter((r) => {
+      const code = (r.code || '').trim().toLowerCase();
+      return code !== '' && code !== 'total';
+    });
 
     // 3a. Upsert semua Product secara BATCH lewat raw SQL. Kita generate
     // UUID di level kode untuk id baru (bukan cuid() default Prisma, karena

@@ -23,7 +23,7 @@ const TOP_N = 30;
  *   - topIn: total IN (koli) terbesar dalam periode (barang paling banyak masuk)
  *   - topOut: total OUT (koli) terbesar dalam periode (barang paling banyak keluar)
  *   - topFrequency: jumlah hari yang punya aktivitas (in>0 atau out>0) terbanyak
- *   - slowMoving: stockCountFinal > 0 (periode BERJALAN, bukan periode
+ *   - slowMoving: stockCountFinal > 100 (periode BERJALAN, bukan periode
  *     filter), tapi total in+out dalam periode filter PALING KECIL
  *     (termasuk yang 0 sama sekali)
  *
@@ -124,7 +124,7 @@ router.get('/movement', async (req, res) => {
 
     // ===== Kategori 4: Punya stok tapi jarang/tidak bergerak =====
     const summariesWithStock = await prisma.stockSummary.findMany({
-      where: { periodLabel: currentPeriodLabel, stockCountFinal: { gt: 0 } },
+      where: { periodLabel: currentPeriodLabel, stockCountFinal: { gt: 100 } },
       include: { product: { select: { id: true, code: true, kategori: true, pcsPerKoli: true } } },
     });
 

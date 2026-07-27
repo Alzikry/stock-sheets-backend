@@ -10,6 +10,7 @@ const syncRoute = require('./routes/sync');
 const productsRoute = require('./routes/products');
 const opnameRoute = require('./routes/opname');
 const reportsRoute = require('./routes/reports');
+const telegramRoute = require('./routes/telegram');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -23,6 +24,7 @@ app.use('/api/sync', syncRoute);
 app.use('/api/products', productsRoute);
 app.use('/api/opname', opnameRoute);
 app.use('/api/reports', reportsRoute);
+app.use('/api/telegram', telegramRoute);
 
 app.get('/', (req, res) => {
   res.json({ message: 'Stock Sheets Viewer API is running' });

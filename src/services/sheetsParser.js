@@ -7,6 +7,41 @@
 const { getSheetsClient } = require('../lib/googleSheets');
 
 /**
+ * Nama-nama bulan dalam Bahasa Indonesia, dipakai untuk mendeteksi baris
+ * rekap/total bulanan seperti "Out Juli", "Out Oktober", dst di tab
+ * "Stock In/Out Summary" -- baris ini BUKAN produk, melainkan baris total
+ * yang sengaja ditulis user di kolom Item untuk rekap manual per bulan.
+ * Baris seperti ini harus di-skip saat parsing, supaya tidak ikut
+ * tersimpan sebagai "produk" di database (lihat isMonthlyRecapRow di bawah).
+ */
+const MONTH_NAMES_ID = [
+  'januari', 'februari', 'maret', 'april', 'mei', 'juni',
+  'juli', 'agustus', 'september', 'oktober', 'november', 'desember',
+];
+
+/**
+ * Deteksi apakah sebuah "code" (isi kolom Item) adalah baris rekap/total
+ * bulanan, bukan nama produk asli. Polanya: diawali kata "Out" (tidak
+ * case-sensitive) diikuti nama bulan dalam Bahasa Indonesia, contoh:
+ * "Out Juli", "Out Oktober", "OUT Januari", dst.
+ *
+ * Baris seperti ini biasa muncul di baris paling bawah tabel sebagai
+ * rekap manual per bulan, dan berubah nama tiap kali user mengganti
+ * periode aktif (misal "Out Oktober" di-rename jadi "Out Juli"). Karena
+ * sync mencocokkan produk berdasarkan nama (code), rename seperti itu
+ * akan dianggap PRODUK BARU alih-alih update, sehingga baris lama yang
+ * usang tetap menumpuk di database. Makanya baris ini sebaiknya tidak
+ * pernah disimpan sebagai produk sama sekali.
+ */
+function isMonthlyRecapRow(code) {
+  if (!code) return false;
+  const match = code.trim().match(/^out\s+([a-z]+)$/i);
+  if (!match) return false;
+  const possibleMonth = match[1].toLowerCase();
+  return MONTH_NAMES_ID.includes(possibleMonth);
+}
+
+/**
  * Ubah format tanggal "13/07/2026" (DD/MM/YYYY) jadi objek Date.
  * Sheet pakai format Indonesia (tanggal/bulan/tahun).
  */
@@ -116,6 +151,16 @@ async function readSummarySheet(spreadsheetId) {
     if (!row || !row[1] || row[1].trim() === '') continue; // baris kosong, skip
 
     const code = row[1].trim();
+
+    // Baris rekap/total bulanan (misal "Out Juli", "Out Oktober") BUKAN
+    // produk asli -- ini baris ringkasan manual yang ditulis user di
+    // kolom Item, biasanya di baris paling bawah tabel. Kalau tidak
+    // di-skip, baris ini akan tersimpan sebagai "produk" di database,
+    // dan setiap kali namanya diganti (misal ganti periode bulan), sync
+    // akan menganggapnya PRODUK BARU alih-alih update -- sehingga baris
+    // lama yang usang menumpuk terus di database/dashboard.
+    if (isMonthlyRecapRow(code)) continue;
+
     const pcsPerKoli = parseInt(row[2], 10) || 1;
     const kategori = row[3] ? row[3].trim() : null;
     const stockHandKoli = parseSheetNumber(row[4]);
@@ -212,6 +257,11 @@ async function readReturSheet(spreadsheetId, year, month) {
     if (!row || !row[1] || row[1].trim() === '') continue; // baris kosong, skip
 
     const code = row[1].trim();
+
+    // Sama seperti di readSummarySheet: baris rekap/total bulanan (misal
+    // "Out Juli") bukan produk asli, skip supaya tidak ikut tersimpan.
+    if (isMonthlyRecapRow(code)) continue;
+
     const dailyEntries = [];
 
     for (const dc of dateColumns) {
@@ -233,6 +283,7 @@ async function readReturSheet(spreadsheetId, year, month) {
 module.exports = {
   parseSheetDate,
   parseSheetNumber,
+  isMonthlyRecapRow,
   readSummarySheet,
   readReturSheet,
 };

@@ -58,6 +58,8 @@ const HELP_TEXT = [
   `/masuk <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat masuk 1 produk dalam rentang tanggal, contoh: /masuk 1681 01-07-2026 s/d 31-07-2026`,
   `/keluar DD-MM-YYYY - daftar LENGKAP semua barang keluar pada tanggal itu, contoh: /keluar 15-07-2026`,
   `/keluar <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat keluar 1 produk dalam rentang tanggal, contoh: /keluar 1681 01-07-2026 s/d 31-07-2026`,
+  `/retur DD-MM-YYYY - daftar LENGKAP semua retur pada tanggal itu, contoh: /retur 15-07-2026`,
+  `/retur <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat retur 1 produk dalam rentang tanggal, contoh: /retur 1681 01-07-2026 s/d 31-07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -415,6 +417,100 @@ async function handleKeluarProdukRange(productQuery, start, end) {
   ].join('\n');
 }
 
+/**
+ * /retur DD-MM-YYYY -- daftar LENGKAP semua produk yang ada retur pada
+ * tanggal tersebut (tanpa batas jumlah).
+ *
+ * /retur <kode_produk> DD-MM-YYYY s/d DD-MM-YYYY -- riwayat retur harian
+ * untuk 1 produk spesifik dalam rentang tanggal.
+ *
+ * Sama persis polanya dengan /masuk, cuma sumber datanya
+ * ReturDailyEntry (returKoli), bukan StockDailyEntry. Retur cuma ada
+ * "masuk" saja (tidak ada versi "keluar"), makanya cuma 1 command.
+ */
+async function handleRetur(arg) {
+  if (!arg) {
+    return 'Format: /retur DD-MM-YYYY\nAtau: /retur <kode_produk> DD-MM-YYYY s/d DD-MM-YYYY\nContoh: /retur 15-07-2026\nContoh: /retur 1681 01-07-2026 s/d 31-07-2026';
+  }
+
+  const rangeResult = parseProductDateRangeArg(arg);
+  if (rangeResult) {
+    if (rangeResult.error) return rangeResult.error;
+    return handleReturProdukRange(rangeResult.productQuery, rangeResult.start, rangeResult.end);
+  }
+
+  // Format lama: 1 tanggal, semua produk
+  const targetDate = parseCommandDate(arg);
+  if (!targetDate) {
+    return 'Format tanggal salah. Gunakan: /retur DD-MM-YYYY\nContoh: /retur 15-07-2026';
+  }
+
+  const start = new Date(targetDate);
+  const end = new Date(targetDate);
+  end.setUTCHours(23, 59, 59, 999);
+
+  const entries = await prisma.returDailyEntry.findMany({
+    where: { date: { gte: start, lte: end }, returKoli: { gt: 0 } },
+    include: { product: { select: { code: true } } },
+    orderBy: { returKoli: 'desc' },
+  });
+
+  if (entries.length === 0) {
+    return `Tidak ada retur pada tanggal ${arg}.`;
+  }
+
+  const lines = entries.map((e, i) => `${i + 1}. ${e.product.code} - ${fmt(e.returKoli)} koli`);
+
+  return [`↩️ Retur pada ${arg} (${entries.length} produk):`, ...lines].join('\n');
+}
+
+/**
+ * Riwayat harian retur untuk 1 produk spesifik dalam rentang tanggal.
+ * Sama persis polanya dengan handleMasukProdukRange, cuma returKoli
+ * dari tabel ReturDailyEntry.
+ */
+async function handleReturProdukRange(productQuery, start, end) {
+  const products = await prisma.product.findMany({
+    where: { code: { contains: productQuery, mode: 'insensitive' } },
+    take: 6,
+  });
+
+  if (products.length === 0) {
+    return `Tidak ada produk yang cocok dengan "${productQuery}".`;
+  }
+  if (products.length > 1) {
+    const codes = products.map((p) => `- ${p.code}`).join('\n');
+    return `Ada ${products.length} produk yang cocok dengan "${productQuery}", perjelas kodenya:\n\n${codes}`;
+  }
+
+  const product = products[0];
+  const entries = await prisma.returDailyEntry.findMany({
+    where: { productId: product.id, date: { gte: start, lte: end } },
+    orderBy: { date: 'asc' },
+  });
+
+  const withActivity = entries.filter((e) => !new Prisma.Decimal(e.returKoli).isZero());
+  const totalRetur = entries.reduce((sum, e) => sum.plus(e.returKoli), new Prisma.Decimal(0));
+
+  const startLabel = formatDateLabel(start);
+  const endLabel = formatDateLabel(end);
+
+  if (withActivity.length === 0) {
+    return `↩️ ${product.code}\nTidak ada retur dari ${startLabel} s/d ${endLabel}.`;
+  }
+
+  const lines = withActivity.map((e) => `${formatDateLabel(e.date)}: ${fmt(e.returKoli)} koli`);
+
+  return [
+    `↩️ Riwayat Retur — ${product.code}`,
+    `Periode: ${startLabel} s/d ${endLabel}`,
+    '',
+    ...lines,
+    '',
+    `Total: ${fmt(totalRetur)} koli`,
+  ].join('\n');
+}
+
 router.post('/webhook', async (req, res) => {
   try {
     const message = req.body.message;
@@ -472,6 +568,9 @@ router.post('/webhook', async (req, res) => {
         break;
       case '/keluar':
         reply = await handleKeluar(arg);
+        break;
+      case '/retur':
+        reply = await handleRetur(arg);
         break;
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;

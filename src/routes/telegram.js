@@ -50,6 +50,7 @@ function fmt(n) {
 const HELP_TEXT = [
   'Perintah yang tersedia:',
   '/stok <nama produk> - cari stok produk',
+  '/stok <kode1>, <kode2>, ... - cari banyak produk sekaligus, contoh: /stok 1681, 1682, 1683',
   '/sync - jalankan sync dari Google Sheets',
   '/opname - ringkasan sesi Stock Opname yang masih berjalan',
   `/laporan - top ${LAPORAN_TOP_N} volume masuk & keluar (30 hari terakhir)`,
@@ -64,15 +65,48 @@ const HELP_TEXT = [
 
 // ===== Handler tiap command =====
 
+/**
+ * /stok <query> -- cari & tampilkan stok produk.
+ *
+ * Bisa diisi 1 kata kunci (perilaku lama, dibatasi 5 hasil), atau
+ * BEBERAPA kata kunci dipisah koma untuk cari banyak produk sekaligus,
+ * contoh: /stok 1681, 1682, 1683 -- masing-masing kata kunci diproses
+ * TERPISAH dan hasilnya dikelompokkan per kata kunci biar jelas. Kalau
+ * mode banyak kata kunci, TIDAK dibatasi 5 hasil per kata kunci (semua
+ * yang cocok ditampilkan), karena user sudah eksplisit tahu kode yang
+ * dicari, beda dari pencarian bebas 1 kata kunci yang bisa sangat umum.
+ */
 async function handleStok(query) {
-  if (!query) return 'Format: /stok <nama produk>\nContoh: /stok Stand Fan 1681';
+  if (!query) return 'Format: /stok <nama produk>\nContoh: /stok Stand Fan 1681\n\nBisa juga banyak sekaligus, dipisah koma:\n/stok 1681, 1682, 1683';
 
   const periodLabel = currentPeriodLabel();
+  const keywords = query.split(',').map((k) => k.trim()).filter(Boolean);
+
+  // Mode 1 kata kunci: perilaku lama persis, dibatasi 5 hasil
+  if (keywords.length === 1) {
+    return formatStokResult(keywords[0], periodLabel, 5);
+  }
+
+  // Mode banyak kata kunci: proses tiap kata kunci terpisah, tanpa
+  // batas hasil, dikelompokkan per kata kunci
+  const sections = [];
+  for (const keyword of keywords) {
+    const result = await formatStokResult(keyword, periodLabel, null);
+    sections.push(`🔎 "${keyword}"\n${result}`);
+  }
+  return sections.join('\n\n---\n\n');
+}
+
+/**
+ * Helper: cari produk by keyword, gabungkan dengan StockSummary periode
+ * berjalan, format jadi teks siap kirim. limit null berarti tanpa batas.
+ */
+async function formatStokResult(keyword, periodLabel, limit) {
   const products = await prisma.product.findMany({
-    where: { code: { contains: query, mode: 'insensitive' } },
-    take: 5,
+    where: { code: { contains: keyword, mode: 'insensitive' } },
+    ...(limit ? { take: limit } : {}),
   });
-  if (products.length === 0) return `Tidak ada produk yang cocok dengan "${query}".`;
+  if (products.length === 0) return `Tidak ada produk yang cocok dengan "${keyword}".`;
 
   const summaries = await prisma.stockSummary.findMany({
     where: { productId: { in: products.map((p) => p.id) }, periodLabel },

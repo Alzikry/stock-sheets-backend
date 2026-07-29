@@ -733,9 +733,12 @@ async function handleRekap(chatId, arg) {
     where: { date: { gte: start, lte: end } },
     include: { product: { select: { code: true, kategori: true } } },
   });
+  const returEntriesCheck = await prisma.returDailyEntry.count({
+    where: { date: { gte: start, lte: end } },
+  });
 
-  if (entries.length === 0) {
-    await sendMessage(chatId, `Tidak ada data In/Out untuk periode ${periodLabel}.`);
+  if (entries.length === 0 && returEntriesCheck === 0) {
+    await sendMessage(chatId, `Tidak ada data In/Out/Retur untuk periode ${periodLabel}.`);
     return;
   }
 
@@ -750,6 +753,7 @@ async function handleRekap(chatId, arg) {
         kategori: e.product.kategori || '-',
         totalIn: new Prisma.Decimal(0),
         totalOut: new Prisma.Decimal(0),
+        totalRetur: new Prisma.Decimal(0),
       });
     }
     const stat = statsByProduct.get(e.productId);
@@ -757,6 +761,29 @@ async function handleRekap(chatId, arg) {
     stat.totalOut = stat.totalOut.plus(e.outKoli);
     grandTotalIn = grandTotalIn.plus(e.inKoli);
     grandTotalOut = grandTotalOut.plus(e.outKoli);
+  }
+
+  // Gabungkan data retur bulan yang sama. Produk yang punya retur tapi
+  // TIDAK punya In/Out (jarang, tapi bisa terjadi) tetap dimasukkan ke
+  // statsByProduct supaya returnya tidak hilang dari rekap.
+  const returEntries = await prisma.returDailyEntry.findMany({
+    where: { date: { gte: start, lte: end } },
+    include: { product: { select: { code: true, kategori: true } } },
+  });
+  let grandTotalRetur = new Prisma.Decimal(0);
+  for (const e of returEntries) {
+    if (!statsByProduct.has(e.productId)) {
+      statsByProduct.set(e.productId, {
+        code: e.product.code,
+        kategori: e.product.kategori || '-',
+        totalIn: new Prisma.Decimal(0),
+        totalOut: new Prisma.Decimal(0),
+        totalRetur: new Prisma.Decimal(0),
+      });
+    }
+    const stat = statsByProduct.get(e.productId);
+    stat.totalRetur = stat.totalRetur.plus(e.returKoli);
+    grandTotalRetur = grandTotalRetur.plus(e.returKoli);
   }
 
   // Ambil stockCountFinal (Retur + Stock Akhir) untuk periode yang sama
@@ -776,9 +803,10 @@ async function handleRekap(chatId, arg) {
     '',
     `Total Masuk: ${fmt(grandTotalIn)} koli`,
     `Total Keluar: ${fmt(grandTotalOut)} koli`,
+    `Total Retur: ${fmt(grandTotalRetur)} koli`,
     `Jumlah produk aktif: ${statsByProduct.size}`,
     '',
-    'Breakdown lengkap per produk (+ stok saat ini) terlampir di file Excel.',
+    'Breakdown lengkap per produk (+ retur & stok saat ini) terlampir di file Excel.',
   ].join('\n');
   await sendMessage(chatId, summaryText);
 
@@ -794,6 +822,7 @@ async function handleRekap(chatId, arg) {
     { header: 'Kategori', key: 'kategori', width: 18 },
     { header: 'Total Masuk (Koli)', key: 'totalIn', width: 18 },
     { header: 'Total Keluar (Koli)', key: 'totalOut', width: 18 },
+    { header: 'Total Retur (Koli)', key: 'totalRetur', width: 18 },
     { header: 'Stok (Koli)', key: 'stok', width: 14 },
   ];
   sheet.getRow(1).font = { bold: true };
@@ -805,6 +834,7 @@ async function handleRekap(chatId, arg) {
       kategori: row.kategori,
       totalIn: Number(row.totalIn),
       totalOut: Number(row.totalOut),
+      totalRetur: Number(row.totalRetur),
       stok: stok !== undefined ? Number(stok) : 'tidak ada data',
     });
   }

@@ -38,6 +38,22 @@ async function sendMessage(chatId, text) {
   });
 }
 
+/**
+ * Kirim foto ke Telegram dari URL gambar (bukan upload file). Dipakai
+ * untuk /chart -- gambar chart digenerate lewat QuickChart.io (layanan
+ * gratis, render chart dari config Chart.js yang dikirim lewat URL),
+ * sehingga backend kita TIDAK perlu install library canvas/gambar
+ * apapun (chartjs-node-canvas dkk sering gagal di lingkungan serverless
+ * seperti Vercel karena butuh native binary Cairo).
+ */
+async function sendPhoto(chatId, photoUrl, caption) {
+  await fetch(`${TELEGRAM_API}/sendPhoto`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption }),
+  });
+}
+
 function currentPeriodLabel() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -61,6 +77,7 @@ const HELP_TEXT = [
   `/keluar <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat keluar 1 produk dalam rentang tanggal, contoh: /keluar 1681 01-07-2026 s/d 31-07-2026`,
   `/retur DD-MM-YYYY - daftar LENGKAP semua retur pada tanggal itu, contoh: /retur 15-07-2026`,
   `/retur <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat retur 1 produk dalam rentang tanggal, contoh: /retur 1681 01-07-2026 s/d 31-07-2026`,
+  `/chart <kode> DD-MM-YYYY s/d DD-MM-YYYY - kirim grafik batang In vs Out 1 produk dalam rentang tanggal, contoh: /chart 1681 01-07-2026 s/d 31-07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -545,6 +562,92 @@ async function handleReturProdukRange(productQuery, start, end) {
   ].join('\n');
 }
 
+/**
+ * /chart <kode_produk> DD-MM-YYYY s/d DD-MM-YYYY -- kirim bar chart
+ * (gambar) In vs Out harian untuk 1 produk dalam rentang tanggal.
+ *
+ * Beda dari handler lain: fungsi ini TIDAK return string biasa, tapi
+ * langsung kirim foto ke chatId (lewat sendPhoto) karena hasilnya
+ * berupa gambar, bukan teks. Caller (router.post) perlu tahu ini --
+ * lihat pengecekan `isChart` di switch-case.
+ */
+async function handleChart(chatId, arg) {
+  if (!arg) {
+    await sendMessage(chatId, 'Format: /chart <kode_produk> DD-MM-YYYY s/d DD-MM-YYYY\nContoh: /chart 1681 01-07-2026 s/d 31-07-2026');
+    return;
+  }
+
+  const rangeResult = parseProductDateRangeArg(arg);
+  if (!rangeResult) {
+    await sendMessage(chatId, 'Format: /chart <kode_produk> DD-MM-YYYY s/d DD-MM-YYYY\nContoh: /chart 1681 01-07-2026 s/d 31-07-2026');
+    return;
+  }
+  if (rangeResult.error) {
+    await sendMessage(chatId, rangeResult.error);
+    return;
+  }
+
+  const { productQuery, start, end } = rangeResult;
+
+  const products = await prisma.product.findMany({
+    where: { code: { contains: productQuery, mode: 'insensitive' } },
+    take: 6,
+  });
+
+  if (products.length === 0) {
+    await sendMessage(chatId, `Tidak ada produk yang cocok dengan "${productQuery}".`);
+    return;
+  }
+  if (products.length > 1) {
+    const codes = products.map((p) => `- ${p.code}`).join('\n');
+    await sendMessage(chatId, `Ada ${products.length} produk yang cocok dengan "${productQuery}", perjelas kodenya:\n\n${codes}`);
+    return;
+  }
+
+  const product = products[0];
+  const entries = await prisma.stockDailyEntry.findMany({
+    where: { productId: product.id, date: { gte: start, lte: end } },
+    orderBy: { date: 'asc' },
+  });
+
+  const withActivity = entries.filter((e) => !(new Prisma.Decimal(e.inKoli).plus(e.outKoli)).isZero());
+
+  if (withActivity.length === 0) {
+    await sendMessage(chatId, `📊 ${product.code}\nTidak ada aktivitas In/Out dari ${formatDateLabel(start)} s/d ${formatDateLabel(end)}.`);
+    return;
+  }
+
+  const labels = withActivity.map((e) => {
+    const d = new Date(e.date);
+    return `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  });
+  const inData = withActivity.map((e) => Number(e.inKoli));
+  const outData = withActivity.map((e) => Number(e.outKoli));
+
+  const chartConfig = {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Masuk', data: inData, backgroundColor: 'rgba(34, 197, 94, 0.8)' },
+        { label: 'Keluar', data: outData, backgroundColor: 'rgba(239, 68, 68, 0.8)' },
+      ],
+    },
+    options: {
+      title: { display: true, text: `${product.code} (koli)` },
+      legend: { display: true },
+    },
+  };
+
+  const chartUrl = `https://quickchart.io/chart?width=700&height=400&backgroundColor=white&c=${encodeURIComponent(JSON.stringify(chartConfig))}`;
+
+  const totalIn = withActivity.reduce((sum, e) => sum.plus(e.inKoli), new Prisma.Decimal(0));
+  const totalOut = withActivity.reduce((sum, e) => sum.plus(e.outKoli), new Prisma.Decimal(0));
+  const caption = `📊 ${product.code}\nPeriode: ${formatDateLabel(start)} s/d ${formatDateLabel(end)}\nTotal Masuk: ${fmt(totalIn)} koli | Total Keluar: ${fmt(totalOut)} koli`;
+
+  await sendPhoto(chatId, chartUrl, caption);
+}
+
 router.post('/webhook', async (req, res) => {
   try {
     const message = req.body.message;
@@ -606,6 +709,11 @@ router.post('/webhook', async (req, res) => {
       case '/retur':
         reply = await handleRetur(arg);
         break;
+      case '/chart':
+        // Beda dari handler lain: handleChart kirim foto sendiri
+        // (lewat sendPhoto), jadi TIDAK perlu reply teks biasa di akhir.
+        await handleChart(chatId, arg);
+        return res.json({ ok: true });
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;
     }

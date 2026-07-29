@@ -21,6 +21,7 @@ const router = express.Router();
 const prisma = require('../lib/prisma');
 const { Prisma } = require('@prisma/client');
 const { syncFromSheets } = require('../services/syncService');
+const ExcelJS = require('exceljs');
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 
@@ -54,6 +55,26 @@ async function sendPhoto(chatId, photoUrl, caption) {
   });
 }
 
+/**
+ * Kirim file (dokumen) ke Telegram dari Buffer, misal file Excel hasil
+ * generate ExcelJS. Beda dari sendMessage/sendPhoto yang JSON biasa --
+ * endpoint sendDocument Telegram butuh multipart/form-data, makanya
+ * pakai FormData + Blob bawaan Node (tersedia sejak Node 18+, TIDAK
+ * perlu install library form-data tambahan).
+ */
+async function sendDocument(chatId, buffer, filename, caption) {
+  const formData = new FormData();
+  formData.append('chat_id', String(chatId));
+  if (caption) formData.append('caption', caption);
+  const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  formData.append('document', blob, filename);
+
+  await fetch(`${TELEGRAM_API}/sendDocument`, {
+    method: 'POST',
+    body: formData,
+  });
+}
+
 function currentPeriodLabel() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -78,6 +99,7 @@ const HELP_TEXT = [
   `/retur DD-MM-YYYY - daftar LENGKAP semua retur pada tanggal itu, contoh: /retur 15-07-2026`,
   `/retur <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat retur 1 produk dalam rentang tanggal, contoh: /retur 1681 01-07-2026 s/d 31-07-2026`,
   `/chart <kode> DD-MM-YYYY s/d DD-MM-YYYY - kirim grafik batang In vs Out 1 produk dalam rentang tanggal, contoh: /chart 1681 01-07-2026 s/d 31-07-2026`,
+  `/rekap [MM-YYYY] - grand total Masuk & Keluar SEMUA produk 1 bulan, + breakdown Excel. Tanpa argumen = bulan berjalan. Contoh: /rekap 07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -182,8 +204,15 @@ async function handleOpname() {
 function parseCommandDate(dateStr) {
   const parts = dateStr.trim().split('-');
   if (parts.length !== 3) return null;
-  const [day, month, year] = parts.map((p) => parseInt(p, 10));
-  if (!day || !month || !year || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const [dayStr, monthStr, yearStr] = parts;
+  // Tahun WAJIB 4 digit -- tanpa ini, input seperti "15-07-26" akan
+  // ke-parse jadi tahun 1926 (parseInt("26") = 26), bukan error, dan
+  // hasilnya diam-diam kosong tanpa user tahu kenapa.
+  if (!/^\d{4}$/.test(yearStr)) return null;
+  const day = parseInt(dayStr, 10);
+  const month = parseInt(monthStr, 10);
+  const year = parseInt(yearStr, 10);
+  if (!day || !month || month < 1 || month > 12 || day < 1 || day > 31) return null;
   return new Date(Date.UTC(year, month - 1, day));
 }
 
@@ -648,6 +677,129 @@ async function handleChart(chatId, arg) {
   await sendPhoto(chatId, chartUrl, caption);
 }
 
+/**
+ * Parse periode format "MM-YYYY" (contoh: "07-2026") jadi { year, month,
+ * label }. Return null kalau formatnya salah.
+ */
+function parsePeriodArg(arg) {
+  const parts = arg.trim().split('-');
+  if (parts.length !== 2) return null;
+  const [monthStr, yearStr] = parts;
+  // Tahun WAJIB 4 digit -- tanpa ini, input seperti "07-26" akan
+  // ke-parse jadi tahun 26 Masehi (bukan 2026), yang lolos validasi
+  // angka tapi jelas bukan maksud user. Selalu bikin bingung karena
+  // sistem tidak kasih error, cuma diam-diam hasilnya kosong.
+  if (!/^\d{4}$/.test(yearStr)) return null;
+  const month = parseInt(monthStr, 10);
+  const year = parseInt(yearStr, 10);
+  if (!month || month < 1 || month > 12) return null;
+  return { year, month, label: `${String(month).padStart(2, '0')}-${year}` };
+}
+
+/**
+ * /rekap [MM-YYYY] -- grand total Masuk & Keluar SEMUA produk dalam 1
+ * bulan penuh, dikirim sebagai 2 bagian:
+ *   1. Pesan teks: grand total keseluruhan (cepat dilihat)
+ *   2. File Excel: breakdown lengkap per produk (kode, kategori, in, out)
+ *
+ * Tanpa argumen -> bulan berjalan. Dengan argumen MM-YYYY -> bulan itu.
+ *
+ * Beda dari handler lain: fungsi ini TIDAK return string, tapi langsung
+ * kirim pesan + file sendiri (chatId diperlukan sebagai parameter),
+ * sama seperti pola handleChart.
+ */
+async function handleRekap(chatId, arg) {
+  let year, month, periodLabel;
+
+  if (arg) {
+    const parsed = parsePeriodArg(arg);
+    if (!parsed) {
+      await sendMessage(chatId, 'Format: /rekap MM-YYYY\nContoh: /rekap 07-2026\n\nAtau /rekap tanpa argumen untuk bulan berjalan.');
+      return;
+    }
+    ({ year, month } = parsed);
+    periodLabel = parsed.label;
+  } else {
+    const now = new Date();
+    year = now.getFullYear();
+    month = now.getMonth() + 1;
+    periodLabel = `${String(month).padStart(2, '0')}-${year}`;
+  }
+
+  const start = new Date(Date.UTC(year, month - 1, 1));
+  const end = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999)); // hari terakhir bulan itu
+
+  const entries = await prisma.stockDailyEntry.findMany({
+    where: { date: { gte: start, lte: end } },
+    include: { product: { select: { code: true, kategori: true } } },
+  });
+
+  if (entries.length === 0) {
+    await sendMessage(chatId, `Tidak ada data In/Out untuk periode ${periodLabel}.`);
+    return;
+  }
+
+  const statsByProduct = new Map();
+  let grandTotalIn = new Prisma.Decimal(0);
+  let grandTotalOut = new Prisma.Decimal(0);
+
+  for (const e of entries) {
+    if (!statsByProduct.has(e.productId)) {
+      statsByProduct.set(e.productId, {
+        code: e.product.code,
+        kategori: e.product.kategori || '-',
+        totalIn: new Prisma.Decimal(0),
+        totalOut: new Prisma.Decimal(0),
+      });
+    }
+    const stat = statsByProduct.get(e.productId);
+    stat.totalIn = stat.totalIn.plus(e.inKoli);
+    stat.totalOut = stat.totalOut.plus(e.outKoli);
+    grandTotalIn = grandTotalIn.plus(e.inKoli);
+    grandTotalOut = grandTotalOut.plus(e.outKoli);
+  }
+
+  // Kirim dulu ringkasan teks, biar user langsung dapat angka besarnya
+  // tanpa perlu buka file Excel dulu
+  const summaryText = [
+    `📊 Rekap Barang Masuk & Keluar — ${periodLabel}`,
+    '',
+    `Total Masuk: ${fmt(grandTotalIn)} koli`,
+    `Total Keluar: ${fmt(grandTotalOut)} koli`,
+    `Jumlah produk aktif: ${statsByProduct.size}`,
+    '',
+    'Breakdown lengkap per produk terlampir di file Excel.',
+  ].join('\n');
+  await sendMessage(chatId, summaryText);
+
+  // Susun file Excel breakdown per produk, urut dari total in+out terbesar
+  const rows = Array.from(statsByProduct.values()).sort((a, b) =>
+    b.totalIn.plus(b.totalOut).comparedTo(a.totalIn.plus(a.totalOut))
+  );
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet(`Rekap ${periodLabel}`);
+  sheet.columns = [
+    { header: 'Kode Produk', key: 'code', width: 35 },
+    { header: 'Kategori', key: 'kategori', width: 18 },
+    { header: 'Total Masuk (Koli)', key: 'totalIn', width: 18 },
+    { header: 'Total Keluar (Koli)', key: 'totalOut', width: 18 },
+  ];
+  sheet.getRow(1).font = { bold: true };
+
+  for (const row of rows) {
+    sheet.addRow({
+      code: row.code,
+      kategori: row.kategori,
+      totalIn: Number(row.totalIn),
+      totalOut: Number(row.totalOut),
+    });
+  }
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  await sendDocument(chatId, buffer, `Rekap ${periodLabel}.xlsx`, `Breakdown per produk — ${periodLabel}`);
+}
+
 router.post('/webhook', async (req, res) => {
   try {
     const message = req.body.message;
@@ -713,6 +865,10 @@ router.post('/webhook', async (req, res) => {
         // Beda dari handler lain: handleChart kirim foto sendiri
         // (lewat sendPhoto), jadi TIDAK perlu reply teks biasa di akhir.
         await handleChart(chatId, arg);
+        return res.json({ ok: true });
+      case '/rekap':
+        // Sama seperti /chart: handleRekap kirim pesan + file sendiri.
+        await handleRekap(chatId, arg);
         return res.json({ ok: true });
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;

@@ -759,6 +759,16 @@ async function handleRekap(chatId, arg) {
     grandTotalOut = grandTotalOut.plus(e.outKoli);
   }
 
+  // Ambil stockCountFinal (Retur + Stock Akhir) untuk periode yang sama
+  // -- dipakai isi kolom "Stok" di Excel. Format periodLabel di
+  // StockSummary itu "YYYY-MM" (beda dari periodLabel command ini yang
+  // "MM-YYYY"), jadi perlu dikonversi dulu.
+  const dbPeriodLabel = `${year}-${String(month).padStart(2, '0')}`;
+  const summaries = await prisma.stockSummary.findMany({
+    where: { productId: { in: Array.from(statsByProduct.keys()) }, periodLabel: dbPeriodLabel },
+  });
+  const stockByProduct = new Map(summaries.map((s) => [s.productId, s.stockCountFinal]));
+
   // Kirim dulu ringkasan teks, biar user langsung dapat angka besarnya
   // tanpa perlu buka file Excel dulu
   const summaryText = [
@@ -768,12 +778,12 @@ async function handleRekap(chatId, arg) {
     `Total Keluar: ${fmt(grandTotalOut)} koli`,
     `Jumlah produk aktif: ${statsByProduct.size}`,
     '',
-    'Breakdown lengkap per produk terlampir di file Excel.',
+    'Breakdown lengkap per produk (+ stok saat ini) terlampir di file Excel.',
   ].join('\n');
   await sendMessage(chatId, summaryText);
 
   // Susun file Excel breakdown per produk, urut dari total in+out terbesar
-  const rows = Array.from(statsByProduct.values()).sort((a, b) =>
+  const rows = Array.from(statsByProduct.entries()).sort(([, a], [, b]) =>
     b.totalIn.plus(b.totalOut).comparedTo(a.totalIn.plus(a.totalOut))
   );
 
@@ -784,15 +794,18 @@ async function handleRekap(chatId, arg) {
     { header: 'Kategori', key: 'kategori', width: 18 },
     { header: 'Total Masuk (Koli)', key: 'totalIn', width: 18 },
     { header: 'Total Keluar (Koli)', key: 'totalOut', width: 18 },
+    { header: 'Stok (Koli)', key: 'stok', width: 14 },
   ];
   sheet.getRow(1).font = { bold: true };
 
-  for (const row of rows) {
+  for (const [productId, row] of rows) {
+    const stok = stockByProduct.get(productId);
     sheet.addRow({
       code: row.code,
       kategori: row.kategori,
       totalIn: Number(row.totalIn),
       totalOut: Number(row.totalOut),
+      stok: stok !== undefined ? Number(stok) : 'tidak ada data',
     });
   }
 

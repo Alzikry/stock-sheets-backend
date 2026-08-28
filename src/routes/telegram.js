@@ -37,6 +37,24 @@ const LAPORAN_TOP_N = 10;
 // ini sebagai default-nya.
 const SLOWMOVING_MIN_STOK = 50;
 
+// Kategori yang ditampilkan di /stokkosong. Dicocokkan ke field
+// `kategori` produk dengan partial match (case-insensitive), bukan
+// exact match -- supaya tetap kena walau penulisan kategorinya agak
+// beda-beda di database, misal "Kipas Angin", "Kompor Gas 2 Tungku",
+// "Magic Com" dll, selama mengandung salah satu kata kunci ini.
+const STOKKOSONG_KATEGORI_FILTER = ['kipas', 'kompor', 'antena', 'blender', 'dispenser', 'magicom'];
+
+// Kata kunci kategori yang DIKECUALIKAN dari /stokkosong meski cocok
+// dengan STOKKOSONG_KATEGORI_FILTER -- khususnya "kipas import" tidak
+// mau ikut ditampilkan (kipas import ditangani terpisah dari kipas
+// biasa). Dicek dengan partial match juga, case-insensitive.
+const STOKKOSONG_KATEGORI_EXCLUDE = ['import'];
+
+// Ambang batas stok (koli) untuk /stokkosong -- semua produk dengan
+// stok DI BAWAH angka ini (termasuk yang kosong/0 dan yang negatif/minus)
+// akan ditampilkan.
+const STOKKOSONG_MAX_STOK = 100;
+
 async function sendMessage(chatId, text) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
@@ -107,7 +125,7 @@ const HELP_TEXT = [
   `/chart <kode> DD-MM-YYYY s/d DD-MM-YYYY - kirim grafik batang In vs Out 1 produk dalam rentang tanggal, contoh: /chart 1681 01-07-2026 s/d 31-07-2026`,
   `/rekap [MM-YYYY] - grand total Masuk & Keluar SEMUA produk 1 bulan, + breakdown Excel. Tanpa argumen = bulan berjalan. Contoh: /rekap 07-2026`,
   `/slowmoving [MM-YYYY] - semua produk berstok di atas ${SLOWMOVING_MIN_STOK} koli dengan Keluar rendah/nol 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
-  `/stokkosong [MM-YYYY] - semua produk dengan stok kosong (0) atau negatif (minus) 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /stokkosong 07-2026`,
+  `/stokkosong [MM-YYYY] - semua produk kategori Kipas(non-import)/Kompor/Antena/Blender/Dispenser/Magicom dengan stok kosong atau di bawah ${STOKKOSONG_MAX_STOK} koli 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /stokkosong 07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -1008,25 +1026,31 @@ async function handleSlowMoving(chatId, arg) {
 }
 
 /**
- * /stokkosong [MM-YYYY] -- semua produk dengan stok KOSONG (persis 0)
- * atau NEGATIF (minus) dalam periode 1 bulan. Berguna untuk cepat
- * ketahuan produk mana yang perlu segera di-restock, atau yang datanya
- * bermasalah (stok minus biasanya nunjukin ada kesalahan input Out
- * lebih besar dari In+stok awal).
+ * /stokkosong [MM-YYYY] -- semua produk dengan stok KOSONG (0) atau
+ * DI BAWAH STOKKOSONG_MAX_STOK (default 100 koli) -- termasuk yang
+ * negatif/minus -- dalam periode 1 bulan. Berguna untuk cepat ketahuan
+ * produk mana yang stoknya menipis/habis dan perlu segera di-restock,
+ * atau yang datanya bermasalah (stok minus biasanya nunjukin ada
+ * kesalahan input Out lebih besar dari In+stok awal).
  *
  * Beda dari /slowmoving yang fokus ke "keluar sedikit", command ini
  * murni lihat angka stockCountFinal itu sendiri -- tidak peduli
  * aktivitas In/Out bulan itu seperti apa.
  *
- * Dipisah jadi 2 kelompok di hasil: "Kosong (0)" dan "Negatif (minus)",
- * karena keduanya butuh tindak lanjut yang beda -- kosong = perlu
- * restock, negatif = kemungkinan ada salah input yang perlu dicek.
+ * Dibatasi HANYA untuk kategori Kipas, Kompor, Antena, Blender,
+ * Dispenser, dan Magicom (STOKKOSONG_KATEGORI_FILTER) -- produk dengan
+ * kategori lain tidak ikut ditampilkan sama sekali. Kategori yang
+ * mengandung kata "import" (mis. "Kipas Import") DIKECUALIKAN meski
+ * kategorinya cocok dengan salah satu di atas
+ * (STOKKOSONG_KATEGORI_EXCLUDE).
+ *
+ * Di pesan ringkasan, hasil dikelompokkan jadi "Negatif (minus)" dan
+ * "Kosong (0)" supaya yang paling butuh perhatian kelihatan duluan.
+ * Tapi file Excel berisi SEMUA produk yang match (kosong, negatif,
+ * MAUPUN yang stoknya 1-99 koli), karena tujuannya sebagai daftar
+ * lengkap untuk ditindaklanjuti restock.
  *
  * Tanpa argumen -> bulan berjalan. Dengan argumen MM-YYYY -> bulan itu.
- *
- * Sama seperti /rekap & /slowmoving: kirim ringkasan teks dulu, lalu
- * file Excel berisi SEMUA produk yang match kriteria (kosong + negatif
- * digabung 1 file, dengan kolom stok supaya kelihatan mana yang minus).
  */
 async function handleStokKosong(chatId, arg) {
   let year, month, periodLabel;
@@ -1052,33 +1076,52 @@ async function handleStokKosong(chatId, arg) {
   const dbPeriodLabel = `${year}-${String(month).padStart(2, '0')}`;
 
   const summaries = await prisma.stockSummary.findMany({
-    where: { periodLabel: dbPeriodLabel, stockCountFinal: { lte: 0 } },
+    where: { periodLabel: dbPeriodLabel, stockCountFinal: { lt: STOKKOSONG_MAX_STOK } },
     include: { product: { select: { id: true, code: true, kategori: true } } },
   });
 
   if (summaries.length === 0) {
-    await sendMessage(chatId, `Tidak ada produk dengan stok kosong atau negatif untuk periode ${periodLabel}. 👍`);
+    await sendMessage(chatId, `Tidak ada produk dengan stok di bawah ${fmt(STOKKOSONG_MAX_STOK)} koli untuk periode ${periodLabel}. 👍`);
     return;
   }
 
-  const rows = summaries.map((s) => ({
+  // Filter kategori Kipas/Kompor/Antena/Blender/Dispenser/Magicom
+  // (partial match, case-insensitive), lalu buang yang mengandung kata
+  // "import" (mis. Kipas Import) -- lihat komentar
+  // STOKKOSONG_KATEGORI_FILTER & STOKKOSONG_KATEGORI_EXCLUDE.
+  const filteredSummaries = summaries.filter((s) => {
+    const kategoriLower = (s.product.kategori || '').toLowerCase();
+    const isTargetCategory = STOKKOSONG_KATEGORI_FILTER.some((keyword) => kategoriLower.includes(keyword));
+    if (!isTargetCategory) return false;
+    const isExcluded = STOKKOSONG_KATEGORI_EXCLUDE.some((keyword) => kategoriLower.includes(keyword));
+    return !isExcluded;
+  });
+
+  if (filteredSummaries.length === 0) {
+    await sendMessage(chatId, `Tidak ada produk kategori Kipas/Kompor/Antena/Blender/Dispenser/Magicom (non-import) dengan stok di bawah ${fmt(STOKKOSONG_MAX_STOK)} koli untuk periode ${periodLabel}. 👍`);
+    return;
+  }
+
+  const rows = filteredSummaries.map((s) => ({
     code: s.product.code,
     kategori: s.product.kategori || '-',
     stok: s.stockCountFinal,
   }));
 
-  const kosong = rows.filter((r) => new Prisma.Decimal(r.stok).isZero());
   const negatif = rows.filter((r) => new Prisma.Decimal(r.stok).isNegative());
+  const kosong = rows.filter((r) => new Prisma.Decimal(r.stok).isZero());
+  const dibawah100 = rows.filter((r) => new Prisma.Decimal(r.stok).isPositive());
   // Urut negatif dari yang paling minus dulu, biar yang paling parah
   // langsung kelihatan di atas.
   negatif.sort((a, b) => new Prisma.Decimal(a.stok).comparedTo(b.stok));
 
   const TOP_N_DI_CHAT = 20;
   const lines = [];
-  lines.push(`⚠️ Stok Kosong / Negatif — ${periodLabel}`);
+  lines.push(`⚠️ Stok Kosong / Di Bawah ${fmt(STOKKOSONG_MAX_STOK)} Koli — Kipas, Kompor, Antena, Blender, Dispenser, Magicom (non-import) — ${periodLabel}`);
   lines.push('');
-  lines.push(`Stok Kosong (0): ${kosong.length} produk`);
   lines.push(`Stok Negatif (minus): ${negatif.length} produk`);
+  lines.push(`Stok Kosong (0): ${kosong.length} produk`);
+  lines.push(`Stok 1-${fmt(STOKKOSONG_MAX_STOK - 1)} koli: ${dibawah100.length} produk`);
   lines.push('');
 
   if (negatif.length > 0) {
@@ -1098,12 +1141,12 @@ async function handleStokKosong(chatId, arg) {
     lines.push('');
   }
 
-  lines.push('Daftar lengkap (kosong + negatif) terlampir di file Excel.');
+  lines.push(`Daftar LENGKAP (termasuk yang stoknya 1-${fmt(STOKKOSONG_MAX_STOK - 1)} koli) terlampir di file Excel.`);
 
   await sendMessage(chatId, lines.join('\n'));
 
-  // File Excel: gabung kosong + negatif, urut stok terkecil (paling
-  // minus) dulu, supaya yang paling perlu perhatian ada di atas.
+  // File Excel: SEMUA produk yang match (negatif + kosong + 1-99),
+  // urut stok terkecil (paling minus/kritis) dulu.
   const allSorted = [...rows].sort((a, b) => new Prisma.Decimal(a.stok).comparedTo(b.stok));
 
   const workbook = new ExcelJS.Workbook();
@@ -1117,16 +1160,22 @@ async function handleStokKosong(chatId, arg) {
   sheet.getRow(1).font = { bold: true };
 
   for (const r of allSorted) {
+    const stokDecimal = new Prisma.Decimal(r.stok);
+    let status;
+    if (stokDecimal.isNegative()) status = 'Negatif';
+    else if (stokDecimal.isZero()) status = 'Kosong';
+    else status = `Di bawah ${fmt(STOKKOSONG_MAX_STOK)}`;
+
     sheet.addRow({
       code: r.code,
       kategori: r.kategori,
       stok: Number(r.stok),
-      status: new Prisma.Decimal(r.stok).isNegative() ? 'Negatif' : 'Kosong',
+      status,
     });
   }
 
   const buffer = await workbook.xlsx.writeBuffer();
-  await sendDocument(chatId, buffer, `Stok Kosong ${periodLabel}.xlsx`, `Semua produk stok kosong/negatif, urut stok terkecil — ${periodLabel}`);
+  await sendDocument(chatId, buffer, `Stok Kosong ${periodLabel}.xlsx`, `Semua produk stok kosong/di bawah ${fmt(STOKKOSONG_MAX_STOK)} koli (Kipas non-import, Kompor, Antena, Blender, Dispenser, Magicom), urut stok terkecil — ${periodLabel}`);
 }
 
 router.post('/webhook', async (req, res) => {

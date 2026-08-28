@@ -107,6 +107,7 @@ const HELP_TEXT = [
   `/chart <kode> DD-MM-YYYY s/d DD-MM-YYYY - kirim grafik batang In vs Out 1 produk dalam rentang tanggal, contoh: /chart 1681 01-07-2026 s/d 31-07-2026`,
   `/rekap [MM-YYYY] - grand total Masuk & Keluar SEMUA produk 1 bulan, + breakdown Excel. Tanpa argumen = bulan berjalan. Contoh: /rekap 07-2026`,
   `/slowmoving [MM-YYYY] - semua produk berstok di atas ${SLOWMOVING_MIN_STOK} koli dengan Keluar rendah/nol 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
+  `/stokkosong [MM-YYYY] - semua produk dengan stok kosong (0) atau negatif (minus) 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /stokkosong 07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -1006,6 +1007,128 @@ async function handleSlowMoving(chatId, arg) {
   await sendDocument(chatId, buffer, `Slow Moving ${periodLabel}.xlsx`, `Semua produk berstok di atas ${fmt(SLOWMOVING_MIN_STOK)} koli, urut Keluar tersedikit — ${periodLabel}`);
 }
 
+/**
+ * /stokkosong [MM-YYYY] -- semua produk dengan stok KOSONG (persis 0)
+ * atau NEGATIF (minus) dalam periode 1 bulan. Berguna untuk cepat
+ * ketahuan produk mana yang perlu segera di-restock, atau yang datanya
+ * bermasalah (stok minus biasanya nunjukin ada kesalahan input Out
+ * lebih besar dari In+stok awal).
+ *
+ * Beda dari /slowmoving yang fokus ke "keluar sedikit", command ini
+ * murni lihat angka stockCountFinal itu sendiri -- tidak peduli
+ * aktivitas In/Out bulan itu seperti apa.
+ *
+ * Dipisah jadi 2 kelompok di hasil: "Kosong (0)" dan "Negatif (minus)",
+ * karena keduanya butuh tindak lanjut yang beda -- kosong = perlu
+ * restock, negatif = kemungkinan ada salah input yang perlu dicek.
+ *
+ * Tanpa argumen -> bulan berjalan. Dengan argumen MM-YYYY -> bulan itu.
+ *
+ * Sama seperti /rekap & /slowmoving: kirim ringkasan teks dulu, lalu
+ * file Excel berisi SEMUA produk yang match kriteria (kosong + negatif
+ * digabung 1 file, dengan kolom stok supaya kelihatan mana yang minus).
+ */
+async function handleStokKosong(chatId, arg) {
+  let year, month, periodLabel;
+
+  if (arg) {
+    const parsed = parsePeriodArg(arg);
+    if (!parsed) {
+      await sendMessage(chatId, 'Format: /stokkosong MM-YYYY\nContoh: /stokkosong 07-2026\n\nAtau /stokkosong tanpa argumen untuk bulan berjalan.');
+      return;
+    }
+    ({ year, month } = parsed);
+    periodLabel = parsed.label;
+  } else {
+    const now = new Date();
+    year = now.getFullYear();
+    month = now.getMonth() + 1;
+    periodLabel = `${String(month).padStart(2, '0')}-${year}`;
+  }
+
+  // Format periodLabel di StockSummary itu "YYYY-MM" (beda dari
+  // periodLabel command ini yang "MM-YYYY"), sama seperti di /rekap
+  // dan /slowmoving.
+  const dbPeriodLabel = `${year}-${String(month).padStart(2, '0')}`;
+
+  const summaries = await prisma.stockSummary.findMany({
+    where: { periodLabel: dbPeriodLabel, stockCountFinal: { lte: 0 } },
+    include: { product: { select: { id: true, code: true, kategori: true } } },
+  });
+
+  if (summaries.length === 0) {
+    await sendMessage(chatId, `Tidak ada produk dengan stok kosong atau negatif untuk periode ${periodLabel}. 👍`);
+    return;
+  }
+
+  const rows = summaries.map((s) => ({
+    code: s.product.code,
+    kategori: s.product.kategori || '-',
+    stok: s.stockCountFinal,
+  }));
+
+  const kosong = rows.filter((r) => new Prisma.Decimal(r.stok).isZero());
+  const negatif = rows.filter((r) => new Prisma.Decimal(r.stok).isNegative());
+  // Urut negatif dari yang paling minus dulu, biar yang paling parah
+  // langsung kelihatan di atas.
+  negatif.sort((a, b) => new Prisma.Decimal(a.stok).comparedTo(b.stok));
+
+  const TOP_N_DI_CHAT = 20;
+  const lines = [];
+  lines.push(`⚠️ Stok Kosong / Negatif — ${periodLabel}`);
+  lines.push('');
+  lines.push(`Stok Kosong (0): ${kosong.length} produk`);
+  lines.push(`Stok Negatif (minus): ${negatif.length} produk`);
+  lines.push('');
+
+  if (negatif.length > 0) {
+    lines.push(`🔴 Stok Negatif${negatif.length > TOP_N_DI_CHAT ? ` (top ${TOP_N_DI_CHAT})` : ''}:`);
+    lines.push(...negatif.slice(0, TOP_N_DI_CHAT).map((r, i) => `${i + 1}. ${r.code} — ${fmt(r.stok)} koli`));
+    lines.push('');
+  }
+
+  if (kosong.length > 0) {
+    const remainingSlots = Math.max(0, TOP_N_DI_CHAT - Math.min(negatif.length, TOP_N_DI_CHAT));
+    lines.push(`⚪ Stok Kosong${kosong.length > remainingSlots ? ` (top ${remainingSlots})` : ''}:`);
+    if (remainingSlots > 0) {
+      lines.push(...kosong.slice(0, remainingSlots).map((r, i) => `${i + 1}. ${r.code}`));
+    } else {
+      lines.push('(lihat file Excel untuk daftar lengkap)');
+    }
+    lines.push('');
+  }
+
+  lines.push('Daftar lengkap (kosong + negatif) terlampir di file Excel.');
+
+  await sendMessage(chatId, lines.join('\n'));
+
+  // File Excel: gabung kosong + negatif, urut stok terkecil (paling
+  // minus) dulu, supaya yang paling perlu perhatian ada di atas.
+  const allSorted = [...rows].sort((a, b) => new Prisma.Decimal(a.stok).comparedTo(b.stok));
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet(`Stok Kosong ${periodLabel}`);
+  sheet.columns = [
+    { header: 'Kode Produk', key: 'code', width: 35 },
+    { header: 'Kategori', key: 'kategori', width: 18 },
+    { header: 'Stok (Koli)', key: 'stok', width: 14 },
+    { header: 'Status', key: 'status', width: 14 },
+  ];
+  sheet.getRow(1).font = { bold: true };
+
+  for (const r of allSorted) {
+    sheet.addRow({
+      code: r.code,
+      kategori: r.kategori,
+      stok: Number(r.stok),
+      status: new Prisma.Decimal(r.stok).isNegative() ? 'Negatif' : 'Kosong',
+    });
+  }
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  await sendDocument(chatId, buffer, `Stok Kosong ${periodLabel}.xlsx`, `Semua produk stok kosong/negatif, urut stok terkecil — ${periodLabel}`);
+}
+
 router.post('/webhook', async (req, res) => {
   try {
     const message = req.body.message;
@@ -1079,6 +1202,10 @@ router.post('/webhook', async (req, res) => {
       case '/slowmoving':
         // Sama seperti /rekap: handleSlowMoving kirim pesan + file sendiri.
         await handleSlowMoving(chatId, arg);
+        return res.json({ ok: true });
+      case '/stokkosong':
+        // Sama seperti /rekap: handleStokKosong kirim pesan + file sendiri.
+        await handleStokKosong(chatId, arg);
         return res.json({ ok: true });
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;

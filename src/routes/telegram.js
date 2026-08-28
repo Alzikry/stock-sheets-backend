@@ -161,6 +161,47 @@ async function formatStokResult(keyword, periodLabel, limit) {
   return lines.join('\n\n');
 }
 
+/**
+ * Cari produk by kode/keyword untuk konteks di mana kita butuh TEPAT 1
+ * produk (dipakai /chart, /masuk, /keluar, /retur mode rentang tanggal).
+ *
+ * Kalau ada yang EXACT match (case-insensitive) dengan productQuery,
+ * langsung pakai itu -- meski ada produk lain yang kodenya mengandung
+ * productQuery sebagai substring (mis. cari "31A" tapi ada juga "31AS"
+ * dan "31AT"). Ini supaya user yang sudah ketik kode lengkap & persis
+ * tidak perlu ditanya lagi "perjelas kodenya".
+ *
+ * Kalau TIDAK ada exact match dan hasil pencarian lebih dari 1, baru
+ * dianggap ambigu dan user diminta memperjelas.
+ *
+ * Return { error: string } kalau 0 hasil atau ambigu.
+ * Return { product } kalau berhasil ketemu 1 produk pasti.
+ */
+async function resolveSingleProduct(productQuery) {
+  const products = await prisma.product.findMany({
+    where: { code: { contains: productQuery, mode: 'insensitive' } },
+    take: 6,
+  });
+
+  if (products.length === 0) {
+    return { error: `Tidak ada produk yang cocok dengan "${productQuery}".` };
+  }
+
+  const exactMatch = products.find(
+    (p) => p.code.toLowerCase() === productQuery.toLowerCase()
+  );
+  if (exactMatch) {
+    return { product: exactMatch };
+  }
+
+  if (products.length > 1) {
+    const codes = products.map((p) => `- ${p.code}`).join('\n');
+    return { error: `Ada ${products.length} produk yang cocok dengan "${productQuery}", perjelas kodenya:\n\n${codes}` };
+  }
+
+  return { product: products[0] };
+}
+
 async function handleSync() {
   const now = new Date();
   const result = await syncFromSheets({
@@ -355,24 +396,15 @@ async function handleMasuk(arg) {
 
 /**
  * Riwayat harian IN untuk 1 produk spesifik dalam rentang tanggal.
- * Kalau productQuery cocok lebih dari 1 produk, minta user perjelas
- * (supaya tidak salah tampilkan data produk yang salah).
+ * Kalau productQuery cocok lebih dari 1 produk tanpa exact match,
+ * resolveSingleProduct akan minta user perjelas (supaya tidak salah
+ * tampilkan data produk yang salah).
  */
 async function handleMasukProdukRange(productQuery, start, end) {
-  const products = await prisma.product.findMany({
-    where: { code: { contains: productQuery, mode: 'insensitive' } },
-    take: 6,
-  });
+  const resolved = await resolveSingleProduct(productQuery);
+  if (resolved.error) return resolved.error;
+  const product = resolved.product;
 
-  if (products.length === 0) {
-    return `Tidak ada produk yang cocok dengan "${productQuery}".`;
-  }
-  if (products.length > 1) {
-    const codes = products.map((p) => `- ${p.code}`).join('\n');
-    return `Ada ${products.length} produk yang cocok dengan "${productQuery}", perjelas kodenya:\n\n${codes}`;
-  }
-
-  const product = products[0];
   const entries = await prisma.stockDailyEntry.findMany({
     where: { productId: product.id, date: { gte: start, lte: end } },
     orderBy: { date: 'asc' },
@@ -456,20 +488,10 @@ async function handleKeluar(arg) {
  * Sama persis polanya dengan handleMasukProdukRange, cuma outKoli.
  */
 async function handleKeluarProdukRange(productQuery, start, end) {
-  const products = await prisma.product.findMany({
-    where: { code: { contains: productQuery, mode: 'insensitive' } },
-    take: 6,
-  });
+  const resolved = await resolveSingleProduct(productQuery);
+  if (resolved.error) return resolved.error;
+  const product = resolved.product;
 
-  if (products.length === 0) {
-    return `Tidak ada produk yang cocok dengan "${productQuery}".`;
-  }
-  if (products.length > 1) {
-    const codes = products.map((p) => `- ${p.code}`).join('\n');
-    return `Ada ${products.length} produk yang cocok dengan "${productQuery}", perjelas kodenya:\n\n${codes}`;
-  }
-
-  const product = products[0];
   const entries = await prisma.stockDailyEntry.findMany({
     where: { productId: product.id, date: { gte: start, lte: end } },
     orderBy: { date: 'asc' },
@@ -550,20 +572,10 @@ async function handleRetur(arg) {
  * dari tabel ReturDailyEntry.
  */
 async function handleReturProdukRange(productQuery, start, end) {
-  const products = await prisma.product.findMany({
-    where: { code: { contains: productQuery, mode: 'insensitive' } },
-    take: 6,
-  });
+  const resolved = await resolveSingleProduct(productQuery);
+  if (resolved.error) return resolved.error;
+  const product = resolved.product;
 
-  if (products.length === 0) {
-    return `Tidak ada produk yang cocok dengan "${productQuery}".`;
-  }
-  if (products.length > 1) {
-    const codes = products.map((p) => `- ${p.code}`).join('\n');
-    return `Ada ${products.length} produk yang cocok dengan "${productQuery}", perjelas kodenya:\n\n${codes}`;
-  }
-
-  const product = products[0];
   const entries = await prisma.returDailyEntry.findMany({
     where: { productId: product.id, date: { gte: start, lte: end } },
     orderBy: { date: 'asc' },
@@ -618,22 +630,13 @@ async function handleChart(chatId, arg) {
 
   const { productQuery, start, end } = rangeResult;
 
-  const products = await prisma.product.findMany({
-    where: { code: { contains: productQuery, mode: 'insensitive' } },
-    take: 6,
-  });
-
-  if (products.length === 0) {
-    await sendMessage(chatId, `Tidak ada produk yang cocok dengan "${productQuery}".`);
+  const resolved = await resolveSingleProduct(productQuery);
+  if (resolved.error) {
+    await sendMessage(chatId, resolved.error);
     return;
   }
-  if (products.length > 1) {
-    const codes = products.map((p) => `- ${p.code}`).join('\n');
-    await sendMessage(chatId, `Ada ${products.length} produk yang cocok dengan "${productQuery}", perjelas kodenya:\n\n${codes}`);
-    return;
-  }
+  const product = resolved.product;
 
-  const product = products[0];
   const entries = await prisma.stockDailyEntry.findMany({
     where: { productId: product.id, date: { gte: start, lte: end } },
     orderBy: { date: 'asc' },

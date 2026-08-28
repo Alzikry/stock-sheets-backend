@@ -100,6 +100,7 @@ const HELP_TEXT = [
   `/retur <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat retur 1 produk dalam rentang tanggal, contoh: /retur 1681 01-07-2026 s/d 31-07-2026`,
   `/chart <kode> DD-MM-YYYY s/d DD-MM-YYYY - kirim grafik batang In vs Out 1 produk dalam rentang tanggal, contoh: /chart 1681 01-07-2026 s/d 31-07-2026`,
   `/rekap [MM-YYYY] - grand total Masuk & Keluar SEMUA produk 1 bulan, + breakdown Excel. Tanpa argumen = bulan berjalan. Contoh: /rekap 07-2026`,
+  `/slowmoving [MM-YYYY] - semua produk berstok dengan Keluar rendah/nol 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -859,6 +860,137 @@ async function handleRekap(chatId, arg) {
   await sendDocument(chatId, buffer, `Rekap ${periodLabel}.xlsx`, `Breakdown per produk — ${periodLabel}`);
 }
 
+/**
+ * /slowmoving [MM-YYYY] -- semua produk yang STOKNYA ADA (stok > 0)
+ * tapi volume Keluar (Out) rendah atau nol dalam periode 1 bulan.
+ * Berguna untuk identifikasi barang yang menumpuk di gudang / jarang
+ * terjual, supaya bisa ditindaklanjuti (promo, retur ke supplier, dll).
+ *
+ * Kriteria "slow moving" di sini SENGAJA fokus ke volume Keluar saja
+ * (bukan In+Out), karena barang yang banyak masuk tapi sedikit/tidak
+ * keluar itu justru DEFINISI slow moving -- kalau dihitung In+Out,
+ * barang yang rajin di-restock (In besar) bisa keliru dianggap "laku"
+ * padahal outnya kecil.
+ *
+ * Tanpa argumen -> bulan berjalan. Dengan argumen MM-YYYY -> bulan itu.
+ *
+ * Urutan hasil: Out TERKECIL dulu (0 di paling atas), supaya produk
+ * paling "macet" langsung kelihatan tanpa perlu scroll.
+ *
+ * Sama seperti /rekap: kirim ringkasan teks dulu (kalau tidak terlalu
+ * panjang, top 20 langsung di chat), lalu file Excel berisi SEMUA
+ * produk yang stoknya ada, supaya tidak kepotong batas panjang pesan
+ * Telegram kalau jumlah produknya banyak.
+ */
+async function handleSlowMoving(chatId, arg) {
+  let year, month, periodLabel;
+
+  if (arg) {
+    const parsed = parsePeriodArg(arg);
+    if (!parsed) {
+      await sendMessage(chatId, 'Format: /slowmoving MM-YYYY\nContoh: /slowmoving 07-2026\n\nAtau /slowmoving tanpa argumen untuk bulan berjalan.');
+      return;
+    }
+    ({ year, month } = parsed);
+    periodLabel = parsed.label;
+  } else {
+    const now = new Date();
+    year = now.getFullYear();
+    month = now.getMonth() + 1;
+    periodLabel = `${String(month).padStart(2, '0')}-${year}`;
+  }
+
+  const start = new Date(Date.UTC(year, month - 1, 1));
+  const end = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+
+  // Format periodLabel di StockSummary itu "YYYY-MM" (beda dari
+  // periodLabel command ini yang "MM-YYYY"), sama seperti di /rekap.
+  const dbPeriodLabel = `${year}-${String(month).padStart(2, '0')}`;
+
+  // Ambil SEMUA produk yang stoknya > 0 di periode ini -- ini basis
+  // utama, bukan StockDailyEntry, karena kita justru mau termasuk
+  // produk yang TIDAK PUNYA entry sama sekali bulan ini (artinya
+  // Out-nya otomatis 0, kandidat paling "slow moving").
+  const summaries = await prisma.stockSummary.findMany({
+    where: { periodLabel: dbPeriodLabel, stockCountFinal: { gt: 0 } },
+    include: { product: { select: { id: true, code: true, kategori: true } } },
+  });
+
+  if (summaries.length === 0) {
+    await sendMessage(chatId, `Tidak ada data stok untuk periode ${periodLabel}.`);
+    return;
+  }
+
+  // Hitung total Out per produk dari StockDailyEntry di periode yang
+  // sama. Produk yang tidak muncul di sini berarti Out-nya 0.
+  const entries = await prisma.stockDailyEntry.findMany({
+    where: {
+      date: { gte: start, lte: end },
+      productId: { in: summaries.map((s) => s.productId) },
+    },
+  });
+  const outByProduct = new Map();
+  for (const e of entries) {
+    const prev = outByProduct.get(e.productId) || new Prisma.Decimal(0);
+    outByProduct.set(e.productId, prev.plus(e.outKoli));
+  }
+
+  // Gabungkan: tiap produk berstok dengan total Out-nya (0 kalau tidak
+  // ada entry sama sekali), lalu urutkan Out terkecil dulu.
+  const rows = summaries.map((s) => ({
+    code: s.product.code,
+    kategori: s.product.kategori || '-',
+    stok: s.stockCountFinal,
+    totalOut: outByProduct.get(s.productId) || new Prisma.Decimal(0),
+  }));
+  rows.sort((a, b) => a.totalOut.comparedTo(b.totalOut));
+
+  const zeroOutCount = rows.filter((r) => r.totalOut.isZero()).length;
+
+  const TOP_N_DI_CHAT = 20;
+  const previewLines = rows.slice(0, TOP_N_DI_CHAT).map((r, i) =>
+    `${i + 1}. ${r.code} — Keluar: ${fmt(r.totalOut)} koli | Stok: ${fmt(r.stok)} koli`
+  );
+
+  const summaryText = [
+    `🐌 Slow Moving — ${periodLabel}`,
+    '',
+    `Total produk berstok: ${rows.length}`,
+    `Produk dengan Keluar = 0: ${zeroOutCount}`,
+    '',
+    `Top ${Math.min(TOP_N_DI_CHAT, rows.length)} paling lambat bergerak (Keluar terkecil):`,
+    ...previewLines,
+    '',
+    rows.length > TOP_N_DI_CHAT
+      ? `Daftar LENGKAP (${rows.length} produk) terlampir di file Excel.`
+      : 'Daftar lengkap juga terlampir di file Excel.',
+  ].join('\n');
+  await sendMessage(chatId, summaryText);
+
+  // File Excel berisi SEMUA produk berstok, urut Out terkecil dulu
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet(`Slow Moving ${periodLabel}`);
+  sheet.columns = [
+    { header: 'Kode Produk', key: 'code', width: 35 },
+    { header: 'Kategori', key: 'kategori', width: 18 },
+    { header: 'Total Keluar (Koli)', key: 'totalOut', width: 18 },
+    { header: 'Stok (Koli)', key: 'stok', width: 14 },
+  ];
+  sheet.getRow(1).font = { bold: true };
+
+  for (const r of rows) {
+    sheet.addRow({
+      code: r.code,
+      kategori: r.kategori,
+      totalOut: Number(r.totalOut),
+      stok: Number(r.stok),
+    });
+  }
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  await sendDocument(chatId, buffer, `Slow Moving ${periodLabel}.xlsx`, `Semua produk berstok, urut Keluar tersedikit — ${periodLabel}`);
+}
+
 router.post('/webhook', async (req, res) => {
   try {
     const message = req.body.message;
@@ -928,6 +1060,10 @@ router.post('/webhook', async (req, res) => {
       case '/rekap':
         // Sama seperti /chart: handleRekap kirim pesan + file sendiri.
         await handleRekap(chatId, arg);
+        return res.json({ ok: true });
+      case '/slowmoving':
+        // Sama seperti /rekap: handleSlowMoving kirim pesan + file sendiri.
+        await handleSlowMoving(chatId, arg);
         return res.json({ ok: true });
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;

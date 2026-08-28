@@ -31,6 +31,12 @@ const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOK
 // padat untuk 1 pesan chat di HP.
 const LAPORAN_TOP_N = 10;
 
+// Batas minimal stok (koli) supaya produk masuk hitungan /slowmoving.
+// Sengaja dipisah jadi konstanta -- kalau suatu saat mau diubah jadi
+// argumen command (mis. /slowmoving 07-2026 100), tinggal pakai variabel
+// ini sebagai default-nya.
+const SLOWMOVING_MIN_STOK = 50;
+
 async function sendMessage(chatId, text) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
@@ -100,7 +106,7 @@ const HELP_TEXT = [
   `/retur <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat retur 1 produk dalam rentang tanggal, contoh: /retur 1681 01-07-2026 s/d 31-07-2026`,
   `/chart <kode> DD-MM-YYYY s/d DD-MM-YYYY - kirim grafik batang In vs Out 1 produk dalam rentang tanggal, contoh: /chart 1681 01-07-2026 s/d 31-07-2026`,
   `/rekap [MM-YYYY] - grand total Masuk & Keluar SEMUA produk 1 bulan, + breakdown Excel. Tanpa argumen = bulan berjalan. Contoh: /rekap 07-2026`,
-  `/slowmoving [MM-YYYY] - semua produk berstok dengan Keluar rendah/nol 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
+  `/slowmoving [MM-YYYY] - semua produk berstok di atas ${SLOWMOVING_MIN_STOK} koli dengan Keluar rendah/nol 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -861,16 +867,22 @@ async function handleRekap(chatId, arg) {
 }
 
 /**
- * /slowmoving [MM-YYYY] -- semua produk yang STOKNYA ADA (stok > 0)
- * tapi volume Keluar (Out) rendah atau nol dalam periode 1 bulan.
- * Berguna untuk identifikasi barang yang menumpuk di gudang / jarang
- * terjual, supaya bisa ditindaklanjuti (promo, retur ke supplier, dll).
+ * /slowmoving [MM-YYYY] -- semua produk yang STOKNYA DI ATAS
+ * SLOWMOVING_MIN_STOK (default 50 koli) tapi volume Keluar (Out) rendah
+ * atau nol dalam periode 1 bulan. Berguna untuk identifikasi barang yang
+ * menumpuk di gudang / jarang terjual, supaya bisa ditindaklanjuti
+ * (promo, retur ke supplier, dll).
  *
  * Kriteria "slow moving" di sini SENGAJA fokus ke volume Keluar saja
  * (bukan In+Out), karena barang yang banyak masuk tapi sedikit/tidak
  * keluar itu justru DEFINISI slow moving -- kalau dihitung In+Out,
  * barang yang rajin di-restock (In besar) bisa keliru dianggap "laku"
  * padahal outnya kecil.
+ *
+ * Filter stok > SLOWMOVING_MIN_STOK sengaja dipakai supaya produk
+ * dengan sisa stok kecil (mis. 1-2 koli sisa terakhir yang memang wajar
+ * jarang bergerak) tidak ikut membanjiri daftar -- fokusnya ke barang
+ * yang jumlahnya besar tapi macet, bukan sisa-sisa kecil yang wajar.
  *
  * Tanpa argumen -> bulan berjalan. Dengan argumen MM-YYYY -> bulan itu.
  *
@@ -879,8 +891,8 @@ async function handleRekap(chatId, arg) {
  *
  * Sama seperti /rekap: kirim ringkasan teks dulu (kalau tidak terlalu
  * panjang, top 20 langsung di chat), lalu file Excel berisi SEMUA
- * produk yang stoknya ada, supaya tidak kepotong batas panjang pesan
- * Telegram kalau jumlah produknya banyak.
+ * produk yang stoknya di atas ambang batas, supaya tidak kepotong batas
+ * panjang pesan Telegram kalau jumlah produknya banyak.
  */
 async function handleSlowMoving(chatId, arg) {
   let year, month, periodLabel;
@@ -907,17 +919,18 @@ async function handleSlowMoving(chatId, arg) {
   // periodLabel command ini yang "MM-YYYY"), sama seperti di /rekap.
   const dbPeriodLabel = `${year}-${String(month).padStart(2, '0')}`;
 
-  // Ambil SEMUA produk yang stoknya > 0 di periode ini -- ini basis
-  // utama, bukan StockDailyEntry, karena kita justru mau termasuk
-  // produk yang TIDAK PUNYA entry sama sekali bulan ini (artinya
-  // Out-nya otomatis 0, kandidat paling "slow moving").
+  // Ambil produk yang stoknya DI ATAS ambang batas di periode ini (dari
+  // StockSummary) -- ini basis utama, bukan StockDailyEntry, karena
+  // kita justru mau termasuk produk yang TIDAK PUNYA entry sama sekali
+  // bulan ini (artinya Out-nya otomatis 0, kandidat paling "slow
+  // moving"), selama stoknya masih di atas ambang batas.
   const summaries = await prisma.stockSummary.findMany({
-    where: { periodLabel: dbPeriodLabel, stockCountFinal: { gt: 0 } },
+    where: { periodLabel: dbPeriodLabel, stockCountFinal: { gt: SLOWMOVING_MIN_STOK } },
     include: { product: { select: { id: true, code: true, kategori: true } } },
   });
 
   if (summaries.length === 0) {
-    await sendMessage(chatId, `Tidak ada data stok untuk periode ${periodLabel}.`);
+    await sendMessage(chatId, `Tidak ada produk dengan stok di atas ${fmt(SLOWMOVING_MIN_STOK)} koli untuk periode ${periodLabel}.`);
     return;
   }
 
@@ -935,8 +948,9 @@ async function handleSlowMoving(chatId, arg) {
     outByProduct.set(e.productId, prev.plus(e.outKoli));
   }
 
-  // Gabungkan: tiap produk berstok dengan total Out-nya (0 kalau tidak
-  // ada entry sama sekali), lalu urutkan Out terkecil dulu.
+  // Gabungkan: tiap produk berstok (di atas ambang batas) dengan total
+  // Out-nya (0 kalau tidak ada entry sama sekali), lalu urutkan Out
+  // terkecil dulu.
   const rows = summaries.map((s) => ({
     code: s.product.code,
     kategori: s.product.kategori || '-',
@@ -953,9 +967,9 @@ async function handleSlowMoving(chatId, arg) {
   );
 
   const summaryText = [
-    `🐌 Slow Moving — ${periodLabel}`,
+    `🐌 Slow Moving — ${periodLabel} (stok di atas ${fmt(SLOWMOVING_MIN_STOK)} koli)`,
     '',
-    `Total produk berstok: ${rows.length}`,
+    `Total produk berstok besar: ${rows.length}`,
     `Produk dengan Keluar = 0: ${zeroOutCount}`,
     '',
     `Top ${Math.min(TOP_N_DI_CHAT, rows.length)} paling lambat bergerak (Keluar terkecil):`,
@@ -967,7 +981,8 @@ async function handleSlowMoving(chatId, arg) {
   ].join('\n');
   await sendMessage(chatId, summaryText);
 
-  // File Excel berisi SEMUA produk berstok, urut Out terkecil dulu
+  // File Excel berisi SEMUA produk berstok di atas ambang batas, urut
+  // Out terkecil dulu
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet(`Slow Moving ${periodLabel}`);
   sheet.columns = [
@@ -988,7 +1003,7 @@ async function handleSlowMoving(chatId, arg) {
   }
 
   const buffer = await workbook.xlsx.writeBuffer();
-  await sendDocument(chatId, buffer, `Slow Moving ${periodLabel}.xlsx`, `Semua produk berstok, urut Keluar tersedikit — ${periodLabel}`);
+  await sendDocument(chatId, buffer, `Slow Moving ${periodLabel}.xlsx`, `Semua produk berstok di atas ${fmt(SLOWMOVING_MIN_STOK)} koli, urut Keluar tersedikit — ${periodLabel}`);
 }
 
 router.post('/webhook', async (req, res) => {

@@ -187,9 +187,22 @@ async function resolveSingleProduct(productQuery) {
     return { error: `Tidak ada produk yang cocok dengan "${productQuery}".` };
   }
 
-  const exactMatch = products.find(
-    (p) => p.code.toLowerCase() === productQuery.toLowerCase()
-  );
+  // "Exact" di sini mencakup 2 kemungkinan:
+  // 1. Kode produk sama persis dengan query, mis. kode "1663" vs query "1663"
+  // 2. Bagian AKHIR kode produk (setelah tanda "-" terakhir) sama persis
+  //    dengan query, mis. kode "WKC-31A" vs query "31A" -- karena banyak
+  //    kode produk di sini pakai format PREFIX-SUFFIX (WKC-31A, WKC-31AS,
+  //    WKC-31AT), dan user biasanya cuma ketik suffix-nya saja tanpa
+  //    prefix. Tanpa ini, "31A" akan selalu dianggap cocok dengan
+  //    "WKC-31A", "WKC-31AS", DAN "WKC-31AT" sekaligus (karena semuanya
+  //    mengandung substring "31A"), padahal user mau yang PERSIS "31A".
+  const queryLower = productQuery.toLowerCase();
+  const exactMatch = products.find((p) => {
+    const codeLower = p.code.toLowerCase();
+    if (codeLower === queryLower) return true;
+    const suffix = codeLower.slice(codeLower.lastIndexOf('-') + 1);
+    return suffix === queryLower;
+  });
   if (exactMatch) {
     return { product: exactMatch };
   }

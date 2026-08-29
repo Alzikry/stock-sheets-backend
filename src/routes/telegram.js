@@ -124,7 +124,7 @@ const HELP_TEXT = [
   `/retur <kode> DD-MM-YYYY s/d DD-MM-YYYY - riwayat retur 1 produk dalam rentang tanggal, contoh: /retur 1681 01-07-2026 s/d 31-07-2026`,
   `/chart <kode> DD-MM-YYYY s/d DD-MM-YYYY - kirim grafik batang In vs Out 1 produk dalam rentang tanggal, contoh: /chart 1681 01-07-2026 s/d 31-07-2026`,
   `/rekap [MM-YYYY] - grand total Masuk & Keluar SEMUA produk 1 bulan, + breakdown Excel. Tanpa argumen = bulan berjalan. Contoh: /rekap 07-2026`,
-  `/slowmoving [MM-YYYY] - semua produk berstok di atas ${SLOWMOVING_MIN_STOK} koli dengan Keluar rendah/nol 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
+  `/slowmoving [MM-YYYY] - semua produk berstok di atas ${SLOWMOVING_MIN_STOK} koli dengan Keluar rendah/nol 1 bulan, dikelompokkan per kategori di Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
   `/stokkosong [MM-YYYY] - semua produk kategori Kipas(non-import)/Kompor/Antena/Blender/Dispenser/Magicom dengan stok kosong atau di bawah ${STOKKOSONG_MAX_STOK} koli 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /stokkosong 07-2026`,
 ].join('\n');
 
@@ -905,13 +905,21 @@ async function handleRekap(chatId, arg) {
  *
  * Tanpa argumen -> bulan berjalan. Dengan argumen MM-YYYY -> bulan itu.
  *
- * Urutan hasil: Out TERKECIL dulu (0 di paling atas), supaya produk
- * paling "macet" langsung kelihatan tanpa perlu scroll.
+ * Urutan hasil: Out TERKECIL dulu (0 di paling atas) DI DALAM tiap
+ * kategori, supaya produk paling "macet" langsung kelihatan tanpa perlu
+ * scroll.
  *
- * Sama seperti /rekap: kirim ringkasan teks dulu (kalau tidak terlalu
- * panjang, top 20 langsung di chat), lalu file Excel berisi SEMUA
- * produk yang stoknya di atas ambang batas, supaya tidak kepotong batas
- * panjang pesan Telegram kalau jumlah produknya banyak.
+ * OUTPUT:
+ *   1. Pesan teks ringkas: total produk, jumlah yang Keluar = 0, dan
+ *      breakdown per kategori (berapa produk tiap kategori).
+ *   2. File Excel, dikelompokkan per SECTION KATEGORI (mis. "Kipas -
+ *      Slow Moving", "Kompor - Slow Moving", dst -- kategori yang tidak
+ *      diisi di database dikelompokkan sebagai "Lainnya"). Tiap section
+ *      berisi kolom NO, Nama Material, Stok (Koli), Total Keluar
+ *      (Koli), Sisa Stok (Koli) -- format ini SENGAJA dibuat meniru
+ *      template Excel manual yang sudah dipakai tim gudang selama ini,
+ *      supaya file dari bot bisa langsung dipakai tanpa perlu format
+ *      ulang manual.
  */
 async function handleSlowMoving(chatId, arg) {
   let year, month, periodLabel;
@@ -967,22 +975,42 @@ async function handleSlowMoving(chatId, arg) {
     outByProduct.set(e.productId, prev.plus(e.outKoli));
   }
 
-  // Gabungkan: tiap produk berstok (di atas ambang batas) dengan total
-  // Out-nya (0 kalau tidak ada entry sama sekali), lalu urutkan Out
-  // terkecil dulu.
+  // Gabungkan: tiap produk berstok (di atas ambang batas) dengan
+  // kategori & total Out-nya (0 kalau tidak ada entry sama sekali).
+  // Kategori kosong/null dikelompokkan sebagai "Lainnya" supaya tidak
+  // hilang dari laporan.
   const rows = summaries.map((s) => ({
     code: s.product.code,
-    kategori: s.product.kategori || '-',
+    kategori: (s.product.kategori && s.product.kategori.trim()) || 'Lainnya',
     stok: s.stockCountFinal,
     totalOut: outByProduct.get(s.productId) || new Prisma.Decimal(0),
   }));
-  rows.sort((a, b) => a.totalOut.comparedTo(b.totalOut));
 
   const zeroOutCount = rows.filter((r) => r.totalOut.isZero()).length;
 
+  // Kelompokkan per kategori, tiap grup diurutkan Out terkecil dulu.
+  const rowsByKategori = new Map();
+  for (const r of rows) {
+    if (!rowsByKategori.has(r.kategori)) rowsByKategori.set(r.kategori, []);
+    rowsByKategori.get(r.kategori).push(r);
+  }
+  for (const groupRows of rowsByKategori.values()) {
+    groupRows.sort((a, b) => a.totalOut.comparedTo(b.totalOut));
+  }
+  // Urutkan kategori berdasarkan JUMLAH produk terbanyak dulu, supaya
+  // kategori paling "bermasalah" (paling banyak barang macet) muncul
+  // di section atas file Excel.
+  const kategoriSorted = Array.from(rowsByKategori.keys()).sort(
+    (a, b) => rowsByKategori.get(b).length - rowsByKategori.get(a).length
+  );
+
+  // Ringkasan teks: breakdown jumlah produk per kategori
+  const kategoriBreakdown = kategoriSorted.map((kat) => `- ${kat}: ${rowsByKategori.get(kat).length} produk`);
+
   const TOP_N_DI_CHAT = 20;
-  const previewLines = rows.slice(0, TOP_N_DI_CHAT).map((r, i) =>
-    `${i + 1}. ${r.code} — Keluar: ${fmt(r.totalOut)} koli | Stok: ${fmt(r.stok)} koli`
+  const allSortedByOut = [...rows].sort((a, b) => a.totalOut.comparedTo(b.totalOut));
+  const previewLines = allSortedByOut.slice(0, TOP_N_DI_CHAT).map((r, i) =>
+    `${i + 1}. ${r.code} (${r.kategori}) — Keluar: ${fmt(r.totalOut)} koli | Stok: ${fmt(r.stok)} koli`
   );
 
   const summaryText = [
@@ -991,38 +1019,60 @@ async function handleSlowMoving(chatId, arg) {
     `Total produk berstok besar: ${rows.length}`,
     `Produk dengan Keluar = 0: ${zeroOutCount}`,
     '',
-    `Top ${Math.min(TOP_N_DI_CHAT, rows.length)} paling lambat bergerak (Keluar terkecil):`,
+    'Breakdown per kategori:',
+    ...kategoriBreakdown,
+    '',
+    `Top ${Math.min(TOP_N_DI_CHAT, allSortedByOut.length)} paling lambat bergerak (Keluar terkecil, semua kategori):`,
     ...previewLines,
     '',
-    rows.length > TOP_N_DI_CHAT
-      ? `Daftar LENGKAP (${rows.length} produk) terlampir di file Excel.`
-      : 'Daftar lengkap juga terlampir di file Excel.',
+    'Daftar LENGKAP per kategori (dipisah per sheet section) terlampir di file Excel.',
   ].join('\n');
   await sendMessage(chatId, summaryText);
 
-  // File Excel berisi SEMUA produk berstok di atas ambang batas, urut
-  // Out terkecil dulu
+  // File Excel: 1 sheet, dikelompokkan jadi beberapa SECTION per
+  // kategori (meniru format template manual tim gudang) -- tiap
+  // section punya judul sendiri, lalu header kolom sendiri, baru
+  // daftar produknya. ExcelJS menulis section-section ini sebagai
+  // baris-baris berurutan dalam 1 sheet yang sama.
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet(`Slow Moving ${periodLabel}`);
-  sheet.columns = [
-    { header: 'Kode Produk', key: 'code', width: 35 },
-    { header: 'Kategori', key: 'kategori', width: 18 },
-    { header: 'Total Keluar (Koli)', key: 'totalOut', width: 18 },
-    { header: 'Stok (Koli)', key: 'stok', width: 14 },
-  ];
-  sheet.getRow(1).font = { bold: true };
 
-  for (const r of rows) {
-    sheet.addRow({
-      code: r.code,
-      kategori: r.kategori,
-      totalOut: Number(r.totalOut),
-      stok: Number(r.stok),
+  // Lebar kolom disamakan untuk semua section, karena semua section
+  // berbagi kolom A-E yang sama.
+  sheet.columns = [
+    { key: 'a', width: 6 },   // NO
+    { key: 'b', width: 40 },  // Nama Material
+    { key: 'c', width: 16 },  // Stok (Koli)
+    { key: 'd', width: 18 },  // Total Keluar (Koli)
+    { key: 'e', width: 14 },  // Sisa Stok (Koli)
+  ];
+
+  for (const kategori of kategoriSorted) {
+    const groupRows = rowsByKategori.get(kategori);
+
+    // Judul section, mis. "Kipas - Slow Moving"
+    const titleRow = sheet.addRow([`${kategori} - Slow Moving`]);
+    titleRow.font = { bold: true, size: 12 };
+    sheet.mergeCells(titleRow.number, 1, titleRow.number, 5);
+
+    // Header kolom section ini
+    const headerRow = sheet.addRow(['NO', 'Nama Material', 'Stok (Koli)', 'Total Keluar (Koli)', 'Sisa Stok (Koli)']);
+    headerRow.font = { bold: true };
+    headerRow.eachCell((cell) => {
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
     });
+
+    // Baris data produk di section ini
+    groupRows.forEach((r, i) => {
+      sheet.addRow([i + 1, r.code, Number(r.stok), Number(r.totalOut), Number(r.stok)]);
+    });
+
+    // Baris kosong pemisah sebelum section berikutnya
+    sheet.addRow([]);
   }
 
   const buffer = await workbook.xlsx.writeBuffer();
-  await sendDocument(chatId, buffer, `Slow Moving ${periodLabel}.xlsx`, `Semua produk berstok di atas ${fmt(SLOWMOVING_MIN_STOK)} koli, urut Keluar tersedikit — ${periodLabel}`);
+  await sendDocument(chatId, buffer, `Slow Moving ${periodLabel}.xlsx`, `Semua produk berstok di atas ${fmt(SLOWMOVING_MIN_STOK)} koli, dikelompokkan per kategori — ${periodLabel}`);
 }
 
 /**

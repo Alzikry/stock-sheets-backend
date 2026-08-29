@@ -1047,27 +1047,57 @@ async function handleSlowMoving(chatId, arg) {
     { key: 'e', width: 14 },  // Sisa Stok (Koli)
   ];
 
+  // Warna & border dipakai supaya file mirip template manual tim
+  // gudang: judul section biru tua dengan teks putih, header kolom
+  // biru muda, dan SEMUA sel (judul, header, data) diberi border tipis
+  // supaya terlihat "berkotak-kotak" seperti contoh.
+  const THIN_BORDER = { style: 'thin', color: { argb: 'FF999999' } };
+  const CELL_BORDER = { top: THIN_BORDER, left: THIN_BORDER, bottom: THIN_BORDER, right: THIN_BORDER };
+  const TITLE_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2F5597' } }; // biru tua
+  const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBDD7EE' } }; // biru muda
+  // Warna baris data diselang-seling (putih / biru sangat muda) supaya
+  // lebih mudah dibaca untuk daftar yang panjang -- efek "zebra stripes".
+  const ROW_FILL_EVEN = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFF6FC' } };
+
   for (const kategori of kategoriSorted) {
     const groupRows = rowsByKategori.get(kategori);
 
-    // Judul section, mis. "Kipas - Slow Moving"
+    // Judul section, mis. "Kipas - Slow Moving" -- background biru tua,
+    // teks putih & bold, di-merge dari kolom A sampai E.
     const titleRow = sheet.addRow([`${kategori} - Slow Moving`]);
-    titleRow.font = { bold: true, size: 12 };
     sheet.mergeCells(titleRow.number, 1, titleRow.number, 5);
+    titleRow.eachCell({ includeEmpty: true }, (cell) => {
+      cell.font = { bold: true, size: 12, color: { argb: 'FFFFFFFF' } };
+      cell.fill = TITLE_FILL;
+      cell.border = CELL_BORDER;
+      cell.alignment = { horizontal: 'left', vertical: 'middle' };
+    });
 
-    // Header kolom section ini
+    // Header kolom section ini -- background biru muda, bold, border
     const headerRow = sheet.addRow(['NO', 'Nama Material', 'Stok (Koli)', 'Total Keluar (Koli)', 'Sisa Stok (Koli)']);
-    headerRow.font = { bold: true };
     headerRow.eachCell((cell) => {
+      cell.font = { bold: true };
+      cell.fill = HEADER_FILL;
+      cell.border = CELL_BORDER;
       cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
     });
 
-    // Baris data produk di section ini
+    // Baris data produk di section ini -- border di semua sel, warna
+    // selang-seling per baris
     groupRows.forEach((r, i) => {
-      sheet.addRow([i + 1, r.code, Number(r.stok), Number(r.totalOut), Number(r.stok)]);
+      const dataRow = sheet.addRow([i + 1, r.code, Number(r.stok), Number(r.totalOut), Number(r.stok)]);
+      dataRow.eachCell({ includeEmpty: true }, (cell) => {
+        cell.border = CELL_BORDER;
+        if (i % 2 === 1) cell.fill = ROW_FILL_EVEN;
+      });
+      dataRow.getCell(1).alignment = { horizontal: 'center' };
+      dataRow.getCell(3).alignment = { horizontal: 'right' };
+      dataRow.getCell(4).alignment = { horizontal: 'right' };
+      dataRow.getCell(5).alignment = { horizontal: 'right' };
     });
 
-    // Baris kosong pemisah sebelum section berikutnya
+    // Baris kosong pemisah sebelum section berikutnya (tanpa border,
+    // supaya jelas beda antar section)
     sheet.addRow([]);
   }
 

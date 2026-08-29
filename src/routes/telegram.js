@@ -720,6 +720,20 @@ async function handleChart(chatId, arg) {
 }
 
 /**
+ * Ubah { year, month } jadi nama bulan berbahasa Indonesia + tahun,
+ * mis. year=2026, month=8 -> "Agustus 2026". Dipakai untuk judul utama
+ * di file Excel /slowmoving dan /stokkosong, supaya lebih mudah dibaca
+ * dibanding format singkat "08-2026".
+ */
+function namaBulanIndonesia(year, month) {
+  const NAMA_BULAN = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+  ];
+  return `${NAMA_BULAN[month - 1]} ${year}`;
+}
+
+/**
  * Parse periode format "MM-YYYY" (contoh: "07-2026") jadi { year, month,
  * label }. Return null kalau formatnya salah.
  */
@@ -1059,6 +1073,18 @@ async function handleSlowMoving(chatId, arg) {
   // lebih mudah dibaca untuk daftar yang panjang -- efek "zebra stripes".
   const ROW_FILL_EVEN = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFF6FC' } };
 
+  // Judul UTAMA di paling atas sheet, di atas semua section kategori --
+  // menyebutkan nama laporan + periode dalam format nama bulan
+  // (mis. "LAPORAN SLOW MOVING - AGUSTUS 2026"), supaya file langsung
+  // jelas ini laporan bulan apa tanpa perlu buka nama file dulu.
+  const mainTitleRow = sheet.addRow([`LAPORAN SLOW MOVING — ${namaBulanIndonesia(year, month).toUpperCase()}`]);
+  sheet.mergeCells(mainTitleRow.number, 1, mainTitleRow.number, 5);
+  mainTitleRow.eachCell({ includeEmpty: true }, (cell) => {
+    cell.font = { bold: true, size: 14, color: { argb: 'FF1F2937' } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
+  sheet.addRow([]); // baris kosong pemisah antara judul utama dan section pertama
+
   for (const kategori of kategoriSorted) {
     const groupRows = rowsByKategori.get(kategori);
 
@@ -1231,13 +1257,26 @@ async function handleStokKosong(chatId, arg) {
 
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet(`Stok Kosong ${periodLabel}`);
+
+  const mainTitleRow = sheet.addRow([`LAPORAN STOK KOSONG — ${namaBulanIndonesia(year, month).toUpperCase()}`]);
+  sheet.mergeCells(mainTitleRow.number, 1, mainTitleRow.number, 4);
+  mainTitleRow.eachCell({ includeEmpty: true }, (cell) => {
+    cell.font = { bold: true, size: 14, color: { argb: 'FF1F2937' } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
+  sheet.addRow([]);
+
   sheet.columns = [
-    { header: 'Kode Produk', key: 'code', width: 35 },
-    { header: 'Kategori', key: 'kategori', width: 18 },
-    { header: 'Stok (Koli)', key: 'stok', width: 14 },
-    { header: 'Status', key: 'status', width: 14 },
+    { key: 'code', width: 35 },
+    { key: 'kategori', width: 18 },
+    { key: 'stok', width: 14 },
+    { key: 'status', width: 14 },
   ];
-  sheet.getRow(1).font = { bold: true };
+  const headerRow = sheet.addRow(['Kode Produk', 'Kategori', 'Stok (Koli)', 'Status']);
+  headerRow.font = { bold: true };
+  headerRow.eachCell((cell) => {
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
 
   for (const r of allSorted) {
     const stokDecimal = new Prisma.Decimal(r.stok);

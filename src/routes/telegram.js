@@ -126,6 +126,8 @@ const HELP_TEXT = [
   `/rekap [MM-YYYY] - grand total Masuk & Keluar SEMUA produk 1 bulan, + breakdown Excel. Tanpa argumen = bulan berjalan. Contoh: /rekap 07-2026`,
   `/slowmoving [MM-YYYY] - semua produk berstok di atas ${SLOWMOVING_MIN_STOK} koli dengan Keluar rendah/nol 1 bulan, dikelompokkan per kategori di Excel. Tanpa argumen = bulan berjalan. Contoh: /slowmoving 07-2026`,
   `/stokkosong [MM-YYYY] - semua produk kategori Kipas(non-import)/Kompor/Antena/Blender/Dispenser/Magicom dengan stok kosong atau di bawah ${STOKKOSONG_MAX_STOK} koli 1 bulan, + daftar lengkap Excel. Tanpa argumen = bulan berjalan. Contoh: /stokkosong 07-2026`,
+  `/banding MM-YYYY - bandingkan volume Masuk & Keluar bulan itu dengan bulan sebelumnya, + breakdown per produk Excel. Contoh: /banding 08-2026`,
+  `/banding MM-YYYY MM-YYYY - bandingkan dua bulan spesifik. Contoh: /banding 07-2026 08-2026`,
 ].join('\n');
 
 // ===== Handler tiap command =====
@@ -1297,6 +1299,251 @@ async function handleStokKosong(chatId, arg) {
   await sendDocument(chatId, buffer, `Stok Kosong ${periodLabel}.xlsx`, `Semua produk stok kosong/di bawah ${fmt(STOKKOSONG_MAX_STOK)} koli (Kipas non-import, Kompor, Antena, Blender, Dispenser, Magicom), urut stok terkecil — ${periodLabel}`);
 }
 
+/**
+ * Parse argumen /banding, yang mendukung 2 bentuk:
+ *   - 1 argumen "MM-YYYY" -> bandingkan bulan itu dengan bulan SEBELUMNYA
+ *     secara otomatis (mis. "08-2026" -> Juli 2026 vs Agustus 2026).
+ *   - 2 argumen "MM-YYYY MM-YYYY" -> bandingkan dua bulan spesifik sesuai
+ *     urutan yang diketik user (bulan pertama = A, bulan kedua = B),
+ *     TIDAK harus berurutan kronologis (biar user bisa banding lintas
+ *     tahun atau lompat beberapa bulan sesuka mereka).
+ *
+ * Return { error: string } kalau format salah.
+ * Return { periodA: {year,month,label}, periodB: {year,month,label} }
+ * kalau berhasil di-parse.
+ */
+function parseBandingArg(arg) {
+  if (!arg) {
+    return { error: 'Format: /banding MM-YYYY (dibanding bulan sebelumnya otomatis)\nAtau: /banding MM-YYYY MM-YYYY (dua bulan spesifik)\n\nContoh: /banding 08-2026\nContoh: /banding 07-2026 08-2026' };
+  }
+
+  const tokens = arg.trim().split(/\s+/);
+
+  if (tokens.length === 1) {
+    const periodB = parsePeriodArg(tokens[0]);
+    if (!periodB) {
+      return { error: 'Format tanggal salah. Gunakan: MM-YYYY\nContoh: /banding 08-2026' };
+    }
+    // Bulan sebelumnya: kalau bulan B adalah Januari (1), bulan
+    // sebelumnya adalah Desember (12) tahun sebelumnya -- jadi TIDAK
+    // bisa asal month - 1, perlu tangani pergantian tahun.
+    let prevMonth = periodB.month - 1;
+    let prevYear = periodB.year;
+    if (prevMonth < 1) {
+      prevMonth = 12;
+      prevYear -= 1;
+    }
+    const periodA = { year: prevYear, month: prevMonth, label: `${String(prevMonth).padStart(2, '0')}-${prevYear}` };
+    return { periodA, periodB };
+  }
+
+  if (tokens.length === 2) {
+    const periodA = parsePeriodArg(tokens[0]);
+    const periodB = parsePeriodArg(tokens[1]);
+    if (!periodA || !periodB) {
+      return { error: 'Format tanggal salah. Gunakan: MM-YYYY MM-YYYY\nContoh: /banding 07-2026 08-2026' };
+    }
+    return { periodA, periodB };
+  }
+
+  return { error: 'Format: /banding MM-YYYY\nAtau: /banding MM-YYYY MM-YYYY\n\nContoh: /banding 08-2026\nContoh: /banding 07-2026 08-2026' };
+}
+
+/**
+ * Hitung persentase perubahan dari nilai lama ke nilai baru. Kasus
+ * khusus: kalau nilai lama 0 dan nilai baru > 0, itu artinya "muncul
+ * dari nol" -- secara matematis pembagian dengan 0 tidak terdefinisi,
+ * jadi kita representasikan sebagai string khusus "Baru" alih-alih
+ * angka persen yang menyesatkan (mis. "+Infinity%" atau NaN).
+ * Kalau keduanya 0, tidak ada perubahan sama sekali -> "0%".
+ */
+function hitungPersenPerubahan(lama, baru) {
+  const lamaNum = Number(lama);
+  const baruNum = Number(baru);
+  if (lamaNum === 0 && baruNum === 0) return '0%';
+  if (lamaNum === 0) return 'Baru';
+  const persen = ((baruNum - lamaNum) / Math.abs(lamaNum)) * 100;
+  const sign = persen > 0 ? '+' : '';
+  return `${sign}${persen.toFixed(1)}%`;
+}
+
+/**
+ * /banding MM-YYYY -- bandingkan volume Masuk & Keluar bulan itu dengan
+ * bulan SEBELUMNYA secara otomatis.
+ * /banding MM-YYYY MM-YYYY -- bandingkan dua bulan spesifik.
+ *
+ * OUTPUT:
+ *   1. Pesan teks: grand total Masuk & Keluar KEDUA bulan, plus
+ *      perubahan dalam persen -- supaya langsung kelihatan tren naik
+ *      atau turun tanpa perlu buka Excel dulu.
+ *   2. File Excel: breakdown PER PRODUK, kolom Masuk & Keluar bulan A,
+ *      Masuk & Keluar bulan B, selisih Keluar, dan %perubahan Keluar --
+ *      diurutkan dari %perubahan Keluar yang PALING TURUN dulu (supaya
+ *      produk yang penjualannya paling anjlok kelihatan di atas, lebih
+ *      actionable untuk ditindaklanjuti dibanding yang naik).
+ *
+ * Sumber data PER PRODUK diambil dari StockDailyEntry (dijumlahkan per
+ * bulan), BUKAN dari StockSummary -- karena StockSummary cuma simpan
+ * angka totalInKoli/totalOutKoli yang sudah dihitung sebelumnya, dan
+ * untuk konsistensi dengan command lain (/rekap, /laporan) yang semua
+ * menghitung ulang dari StockDailyEntry secara langsung.
+ */
+async function handleBanding(chatId, arg) {
+  const parsed = parseBandingArg(arg);
+  if (parsed.error) {
+    await sendMessage(chatId, parsed.error);
+    return;
+  }
+  const { periodA, periodB } = parsed;
+
+  const startA = new Date(Date.UTC(periodA.year, periodA.month - 1, 1));
+  const endA = new Date(Date.UTC(periodA.year, periodA.month, 0, 23, 59, 59, 999));
+  const startB = new Date(Date.UTC(periodB.year, periodB.month - 1, 1));
+  const endB = new Date(Date.UTC(periodB.year, periodB.month, 0, 23, 59, 59, 999));
+
+  const [entriesA, entriesB] = await Promise.all([
+    prisma.stockDailyEntry.findMany({
+      where: { date: { gte: startA, lte: endA } },
+      include: { product: { select: { code: true, kategori: true } } },
+    }),
+    prisma.stockDailyEntry.findMany({
+      where: { date: { gte: startB, lte: endB } },
+      include: { product: { select: { code: true, kategori: true } } },
+    }),
+  ]);
+
+  if (entriesA.length === 0 && entriesB.length === 0) {
+    await sendMessage(chatId, `Tidak ada data In/Out untuk periode ${periodA.label} maupun ${periodB.label}.`);
+    return;
+  }
+
+  // Agregasi per produk untuk masing-masing bulan
+  function aggregasiPerProduk(entries) {
+    const map = new Map();
+    for (const e of entries) {
+      if (!map.has(e.productId)) {
+        map.set(e.productId, {
+          code: e.product.code,
+          kategori: e.product.kategori || '-',
+          totalIn: new Prisma.Decimal(0),
+          totalOut: new Prisma.Decimal(0),
+        });
+      }
+      const stat = map.get(e.productId);
+      stat.totalIn = stat.totalIn.plus(e.inKoli);
+      stat.totalOut = stat.totalOut.plus(e.outKoli);
+    }
+    return map;
+  }
+
+  const statsA = aggregasiPerProduk(entriesA);
+  const statsB = aggregasiPerProduk(entriesB);
+
+  // Grand total kedua bulan, untuk ringkasan teks
+  let grandInA = new Prisma.Decimal(0), grandOutA = new Prisma.Decimal(0);
+  for (const s of statsA.values()) { grandInA = grandInA.plus(s.totalIn); grandOutA = grandOutA.plus(s.totalOut); }
+  let grandInB = new Prisma.Decimal(0), grandOutB = new Prisma.Decimal(0);
+  for (const s of statsB.values()) { grandInB = grandInB.plus(s.totalIn); grandOutB = grandOutB.plus(s.totalOut); }
+
+  const summaryText = [
+    `📊 Perbandingan Bulan — ${periodA.label} vs ${periodB.label}`,
+    '',
+    `Total Masuk:`,
+    `  ${periodA.label}: ${fmt(grandInA)} koli`,
+    `  ${periodB.label}: ${fmt(grandInB)} koli (${hitungPersenPerubahan(grandInA, grandInB)})`,
+    '',
+    `Total Keluar:`,
+    `  ${periodA.label}: ${fmt(grandOutA)} koli`,
+    `  ${periodB.label}: ${fmt(grandOutB)} koli (${hitungPersenPerubahan(grandOutA, grandOutB)})`,
+    '',
+    'Breakdown lengkap per produk (urut dari Keluar paling turun) terlampir di file Excel.',
+  ].join('\n');
+  await sendMessage(chatId, summaryText);
+
+  // Gabungkan daftar produk dari KEDUA bulan (union), supaya produk yang
+  // cuma ada di salah satu bulan saja (mis. baru mulai dijual bulan B,
+  // atau berhenti dijual setelah bulan A) tetap muncul di breakdown,
+  // dengan nilai 0 untuk bulan yang tidak punya datanya.
+  const allProductIds = new Set([...statsA.keys(), ...statsB.keys()]);
+  const rows = Array.from(allProductIds).map((productId) => {
+    const a = statsA.get(productId);
+    const b = statsB.get(productId);
+    const code = (a || b).code;
+    const kategori = (a || b).kategori;
+    const inA = a ? a.totalIn : new Prisma.Decimal(0);
+    const outA = a ? a.totalOut : new Prisma.Decimal(0);
+    const inB = b ? b.totalIn : new Prisma.Decimal(0);
+    const outB = b ? b.totalOut : new Prisma.Decimal(0);
+    return {
+      code,
+      kategori,
+      inA, outA, inB, outB,
+      selisihOut: outB.minus(outA),
+      persenOut: hitungPersenPerubahan(outA, outB),
+    };
+  });
+
+  // Urut dari Keluar paling TURUN dulu (selisih paling negatif di atas)
+  rows.sort((x, y) => x.selisihOut.comparedTo(y.selisihOut));
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet(`Banding ${periodA.label} vs ${periodB.label}`);
+
+  const mainTitleRow = sheet.addRow([
+    `PERBANDINGAN BULAN — ${namaBulanIndonesia(periodA.year, periodA.month).toUpperCase()} VS ${namaBulanIndonesia(periodB.year, periodB.month).toUpperCase()}`,
+  ]);
+  sheet.mergeCells(mainTitleRow.number, 1, mainTitleRow.number, 7);
+  mainTitleRow.eachCell({ includeEmpty: true }, (cell) => {
+    cell.font = { bold: true, size: 14, color: { argb: 'FF1F2937' } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
+  sheet.addRow([]);
+
+  sheet.columns = [
+    { key: 'code', width: 35 },
+    { key: 'kategori', width: 18 },
+    { key: 'inA', width: 14 },
+    { key: 'outA', width: 14 },
+    { key: 'inB', width: 14 },
+    { key: 'outB', width: 14 },
+    { key: 'selisih', width: 14 },
+    { key: 'persen', width: 12 },
+  ];
+
+  const headerRow = sheet.addRow([
+    'Kode Produk', 'Kategori',
+    `Masuk ${periodA.label}`, `Keluar ${periodA.label}`,
+    `Masuk ${periodB.label}`, `Keluar ${periodB.label}`,
+    'Selisih Keluar', '% Perubahan Keluar',
+  ]);
+  headerRow.font = { bold: true };
+  headerRow.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBDD7EE' } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  });
+
+  for (const r of rows) {
+    sheet.addRow({
+      code: r.code,
+      kategori: r.kategori,
+      inA: Number(r.inA),
+      outA: Number(r.outA),
+      inB: Number(r.inB),
+      outB: Number(r.outB),
+      selisih: Number(r.selisihOut),
+      persen: r.persenOut,
+    });
+  }
+
+  const buffer2 = await workbook.xlsx.writeBuffer();
+  await sendDocument(
+    chatId,
+    buffer2,
+    `Banding ${periodA.label} vs ${periodB.label}.xlsx`,
+    `Breakdown per produk, urut Keluar paling turun — ${periodA.label} vs ${periodB.label}`
+  );
+}
+
 router.post('/webhook', async (req, res) => {
   try {
     const message = req.body.message;
@@ -1374,6 +1621,10 @@ router.post('/webhook', async (req, res) => {
       case '/stokkosong':
         // Sama seperti /rekap: handleStokKosong kirim pesan + file sendiri.
         await handleStokKosong(chatId, arg);
+        return res.json({ ok: true });
+      case '/banding':
+        // Sama seperti /rekap: handleBanding kirim pesan + file sendiri.
+        await handleBanding(chatId, arg);
         return res.json({ ok: true });
       default:
         reply = `Perintah tidak dikenali.\n\n${HELP_TEXT}`;

@@ -1463,13 +1463,15 @@ async function handleBanding(chatId, arg) {
   // Gabungkan daftar produk dari KEDUA bulan (union), supaya produk yang
   // cuma ada di salah satu bulan saja (mis. baru mulai dijual bulan B,
   // atau berhenti dijual setelah bulan A) tetap muncul di breakdown,
-  // dengan nilai 0 untuk bulan yang tidak punya datanya.
+  // dengan nilai 0 untuk bulan yang tidak punya datanya. Kategori
+  // kosong/null dikelompokkan sebagai "Lainnya", sama seperti /slowmoving.
   const allProductIds = new Set([...statsA.keys(), ...statsB.keys()]);
   const rows = Array.from(allProductIds).map((productId) => {
     const a = statsA.get(productId);
     const b = statsB.get(productId);
     const code = (a || b).code;
-    const kategori = (a || b).kategori;
+    const kategoriAsli = (a || b).kategori;
+    const kategori = (kategoriAsli && kategoriAsli.trim() && kategoriAsli !== '-') ? kategoriAsli : 'Lainnya';
     const inA = a ? a.totalIn : new Prisma.Decimal(0);
     const outA = a ? a.totalOut : new Prisma.Decimal(0);
     const inB = b ? b.totalIn : new Prisma.Decimal(0);
@@ -1483,12 +1485,47 @@ async function handleBanding(chatId, arg) {
     };
   });
 
-  // Urut dari Keluar paling TURUN dulu (selisih paling negatif di atas)
-  rows.sort((x, y) => x.selisihOut.comparedTo(y.selisihOut));
+  // Kelompokkan per kategori, tiap grup diurutkan Keluar paling TURUN
+  // dulu (selisih paling negatif di atas) -- sama seperti pengurutan
+  // di /slowmoving, supaya produk paling "anjlok" penjualannya langsung
+  // kelihatan di baris atas tiap section.
+  const rowsByKategori = new Map();
+  for (const r of rows) {
+    if (!rowsByKategori.has(r.kategori)) rowsByKategori.set(r.kategori, []);
+    rowsByKategori.get(r.kategori).push(r);
+  }
+  for (const groupRows of rowsByKategori.values()) {
+    groupRows.sort((x, y) => x.selisihOut.comparedTo(y.selisihOut));
+  }
+  // Urutkan kategori berdasarkan JUMLAH produk terbanyak dulu, konsisten
+  // dengan /slowmoving.
+  const kategoriSorted = Array.from(rowsByKategori.keys()).sort(
+    (a, b) => rowsByKategori.get(b).length - rowsByKategori.get(a).length
+  );
 
+  // File Excel: 1 sheet, dikelompokkan jadi beberapa SECTION per
+  // kategori -- sama persis polanya dengan /slowmoving, supaya format
+  // konsisten dan gampang dibaca antar laporan.
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet(`Banding ${periodA.label} vs ${periodB.label}`);
 
+  sheet.columns = [
+    { key: 'a', width: 35 },  // Kode Produk
+    { key: 'b', width: 14 },  // Masuk A
+    { key: 'c', width: 14 },  // Keluar A
+    { key: 'd', width: 14 },  // Masuk B
+    { key: 'e', width: 14 },  // Keluar B
+    { key: 'f', width: 15 },  // Selisih Keluar
+    { key: 'g', width: 15 },  // % Perubahan Keluar
+  ];
+
+  const THIN_BORDER = { style: 'thin', color: { argb: 'FF999999' } };
+  const CELL_BORDER = { top: THIN_BORDER, left: THIN_BORDER, bottom: THIN_BORDER, right: THIN_BORDER };
+  const TITLE_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2F5597' } }; // biru tua
+  const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBDD7EE' } }; // biru muda
+  const ROW_FILL_EVEN = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFF6FC' } };
+
+  // Judul UTAMA di paling atas sheet, di atas semua section kategori
   const mainTitleRow = sheet.addRow([
     `PERBANDINGAN BULAN — ${namaBulanIndonesia(periodA.year, periodA.month).toUpperCase()} VS ${namaBulanIndonesia(periodB.year, periodB.month).toUpperCase()}`,
   ]);
@@ -1497,42 +1534,54 @@ async function handleBanding(chatId, arg) {
     cell.font = { bold: true, size: 14, color: { argb: 'FF1F2937' } };
     cell.alignment = { horizontal: 'center', vertical: 'middle' };
   });
-  sheet.addRow([]);
+  sheet.addRow([]); // baris kosong pemisah
 
-  sheet.columns = [
-    { key: 'code', width: 35 },
-    { key: 'kategori', width: 18 },
-    { key: 'inA', width: 14 },
-    { key: 'outA', width: 14 },
-    { key: 'inB', width: 14 },
-    { key: 'outB', width: 14 },
-    { key: 'selisih', width: 14 },
-    { key: 'persen', width: 12 },
-  ];
+  for (const kategori of kategoriSorted) {
+    const groupRows = rowsByKategori.get(kategori);
 
-  const headerRow = sheet.addRow([
-    'Kode Produk', 'Kategori',
-    `Masuk ${periodA.label}`, `Keluar ${periodA.label}`,
-    `Masuk ${periodB.label}`, `Keluar ${periodB.label}`,
-    'Selisih Keluar', '% Perubahan Keluar',
-  ]);
-  headerRow.font = { bold: true };
-  headerRow.eachCell((cell) => {
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBDD7EE' } };
-    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-  });
-
-  for (const r of rows) {
-    sheet.addRow({
-      code: r.code,
-      kategori: r.kategori,
-      inA: Number(r.inA),
-      outA: Number(r.outA),
-      inB: Number(r.inB),
-      outB: Number(r.outB),
-      selisih: Number(r.selisihOut),
-      persen: r.persenOut,
+    // Judul section, mis. "Kipas - Perbandingan Bulan"
+    const titleRow = sheet.addRow([`${kategori} - Perbandingan Bulan`]);
+    sheet.mergeCells(titleRow.number, 1, titleRow.number, 7);
+    titleRow.eachCell({ includeEmpty: true }, (cell) => {
+      cell.font = { bold: true, size: 12, color: { argb: 'FFFFFFFF' } };
+      cell.fill = TITLE_FILL;
+      cell.border = CELL_BORDER;
+      cell.alignment = { horizontal: 'left', vertical: 'middle' };
     });
+
+    // Header kolom section ini
+    const headerRow = sheet.addRow([
+      'Kode Produk',
+      `Masuk ${periodA.label}`, `Keluar ${periodA.label}`,
+      `Masuk ${periodB.label}`, `Keluar ${periodB.label}`,
+      'Selisih Keluar', '% Perubahan Keluar',
+    ]);
+    headerRow.eachCell((cell) => {
+      cell.font = { bold: true };
+      cell.fill = HEADER_FILL;
+      cell.border = CELL_BORDER;
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    });
+
+    // Baris data produk di section ini
+    groupRows.forEach((r, i) => {
+      const dataRow = sheet.addRow([
+        r.code,
+        Number(r.inA), Number(r.outA),
+        Number(r.inB), Number(r.outB),
+        Number(r.selisihOut), r.persenOut,
+      ]);
+      dataRow.eachCell({ includeEmpty: true }, (cell) => {
+        cell.border = CELL_BORDER;
+        if (i % 2 === 1) cell.fill = ROW_FILL_EVEN;
+      });
+      for (let col = 2; col <= 7; col++) {
+        dataRow.getCell(col).alignment = { horizontal: 'right' };
+      }
+    });
+
+    // Baris kosong pemisah sebelum section berikutnya
+    sheet.addRow([]);
   }
 
   const buffer2 = await workbook.xlsx.writeBuffer();
@@ -1540,9 +1589,10 @@ async function handleBanding(chatId, arg) {
     chatId,
     buffer2,
     `Banding ${periodA.label} vs ${periodB.label}.xlsx`,
-    `Breakdown per produk, urut Keluar paling turun — ${periodA.label} vs ${periodB.label}`
+    `Breakdown per produk per kategori, urut Keluar paling turun — ${periodA.label} vs ${periodB.label}`
   );
 }
+
 
 router.post('/webhook', async (req, res) => {
   try {

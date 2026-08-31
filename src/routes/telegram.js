@@ -1610,24 +1610,48 @@ async function handleBanding(chatId, arg) {
     })
     .filter((k) => !(k.totalInA.isZero() && k.totalOutA.isZero() && k.totalInB.isZero() && k.totalOutB.isZero()));
 
+  // Urutkan dari Keluar bulan B (data terbaru) TERBESAR dulu -- lalu di
+  // chart nanti kita balik lagi urutannya (lihat .reverse() di bawah),
+  // karena horizontal bar chart di Chart.js/QuickChart menggambar dari
+  // BAWAH ke ATAS secara default, jadi supaya kategori terbesar muncul
+  // di posisi PALING ATAS (sesuai ekspektasi visual "urut dari besar"),
+  // urutan datanya perlu dibalik dulu sebelum dikirim ke chart.
+  kategoriChartData.sort((a, b) => b.totalOutB.comparedTo(a.totalOutB));
+
   if (kategoriChartData.length > 0) {
-    const labels = kategoriChartData.map((k) => k.kategori);
+    const dataUntukChart = [...kategoriChartData].reverse();
+    const labels = dataUntukChart.map((k) => k.kategori);
+
+    // Horizontal bar chart dipilih (bukan vertical) supaya nama
+    // kategori yang panjang (mis. "Kompor Import", "Antena Import")
+    // bisa dibaca penuh secara horizontal tanpa terpotong/miring, dan
+    // supaya kategori dengan volume jauh lebih besar (mis. Kipas) tidak
+    // "menenggelamkan" secara visual kategori-kategori kecil lainnya --
+    // setiap bar tetap proporsional terhadap lebar chart yang sama.
     const chartConfig = {
-      type: 'bar',
+      type: 'horizontalBar',
       data: {
         labels,
         datasets: [
-          { label: `Keluar ${periodA.label}`, data: kategoriChartData.map((k) => Number(k.totalOutA)), backgroundColor: 'rgba(239, 68, 68, 0.5)' },
-          { label: `Keluar ${periodB.label}`, data: kategoriChartData.map((k) => Number(k.totalOutB)), backgroundColor: 'rgba(239, 68, 68, 0.9)' },
+          { label: `Keluar ${periodA.label}`, data: dataUntukChart.map((k) => Number(k.totalOutA)), backgroundColor: 'rgba(239, 68, 68, 0.5)' },
+          { label: `Keluar ${periodB.label}`, data: dataUntukChart.map((k) => Number(k.totalOutB)), backgroundColor: 'rgba(239, 68, 68, 0.9)' },
         ],
       },
       options: {
         title: { display: true, text: `Perbandingan Keluar per Kategori — ${periodA.label} vs ${periodB.label}` },
-        legend: { display: true },
+        legend: { display: true, position: 'bottom' },
+        scales: {
+          xAxes: [{ ticks: { beginAtZero: true } }],
+        },
       },
     };
-    const chartUrl = `https://quickchart.io/chart?width=800&height=450&backgroundColor=white&c=${encodeURIComponent(JSON.stringify(chartConfig))}`;
-    await sendPhoto(chatId, chartUrl, `📊 Grafik ringkasan Keluar per kategori — ${periodA.label} vs ${periodB.label}`);
+    // Tinggi chart menyesuaikan jumlah kategori (tiap kategori butuh
+    // ruang vertikal yang cukup untuk 2 bar + label), supaya tetap
+    // terbaca walau kategorinya banyak (14+ seperti kasus sekarang)
+    // maupun sedikit -- tidak kepepet sempit atau kosong terlalu lega.
+    const chartHeight = Math.max(400, dataUntukChart.length * 45 + 120);
+    const chartUrl = `https://quickchart.io/chart?width=800&height=${chartHeight}&backgroundColor=white&c=${encodeURIComponent(JSON.stringify(chartConfig))}`;
+    await sendPhoto(chatId, chartUrl, `📊 Grafik ringkasan Keluar per kategori (urut terbesar) — ${periodA.label} vs ${periodB.label}`);
   }
 }
 

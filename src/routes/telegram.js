@@ -1610,24 +1610,72 @@ async function handleBanding(chatId, arg) {
     })
     .filter((k) => !(k.totalInA.isZero() && k.totalOutA.isZero() && k.totalInB.isZero() && k.totalOutB.isZero()));
 
-  // Urutkan dari Keluar bulan B (data terbaru) TERBESAR dulu -- lalu di
-  // chart nanti kita balik lagi urutannya (lihat .reverse() di bawah),
-  // karena horizontal bar chart di Chart.js/QuickChart menggambar dari
-  // BAWAH ke ATAS secara default, jadi supaya kategori terbesar muncul
-  // di posisi PALING ATAS (sesuai ekspektasi visual "urut dari besar"),
-  // urutan datanya perlu dibalik dulu sebelum dikirim ke chart.
+  // Urutkan dari Keluar bulan B (data terbaru) TERBESAR dulu -- dipakai
+  // sebagai basis untuk deteksi "gap" dan urutan tampil di chart.
   kategoriChartData.sort((a, b) => b.totalOutB.comparedTo(a.totalOutB));
 
-  if (kategoriChartData.length > 0) {
-    const dataUntukChart = [...kategoriChartData].reverse();
+  /**
+   * Cari titik pemisah "kategori besar" vs "kategori kecil" secara
+   * ADAPTIF (bukan angka ambang batas tetap yang bisa salah di bulan
+   * lain dengan skala data berbeda) -- caranya, cari LOMPATAN/GAP
+   * terbesar di antara nilai-nilai yang sudah diurutkan (nilai tertinggi
+   * yang dipakai acuan = totalOutB, sama seperti data terbesar kasus
+   * "Kipas" yang jauh melampaui kategori lain).
+   *
+   * Contoh kasus nyata: [37000, 4500, 3900, 3700, ...] -- gap antara
+   * 37000 dan 4500 jauh lebih besar (32500) dibanding gap-gap
+   * berikutnya (rata-rata ratusan) -- titik itulah yang dipakai sebagai
+   * garis pemisah "kategori besar" (index 0) vs "kategori kecil" (index
+   * 1 dst).
+   *
+   * Kalau tidak ada gap yang signifikan (semua kategori nilainya cukup
+   * merata), TIDAK perlu dipisah -- cukup 1 chart saja, karena memang
+   * skalanya sudah cukup seragam untuk dibaca bersama.
+   */
+  function cariTitikPisahAdaptif(dataUrutTerbesar) {
+    if (dataUrutTerbesar.length < 3) return dataUrutTerbesar.length; // terlalu sedikit kategori, tidak perlu dipisah
+
+    const nilai = dataUrutTerbesar.map((k) => Number(k.totalOutB));
+    let gapTerbesar = 0;
+    let indexGapTerbesar = -1;
+
+    for (let i = 0; i < nilai.length - 1; i++) {
+      const gap = nilai[i] - nilai[i + 1];
+      if (gap > gapTerbesar) {
+        gapTerbesar = gap;
+        indexGapTerbesar = i;
+      }
+    }
+
+    // Gap dianggap signifikan kalau BESARNYA GAP itu sendiri lebih dari
+    // separuh nilai tertinggi -- ini nunjukin ada kategori yang memang
+    // "beda kelas" dari sisanya, bukan cuma variasi wajar antar kategori.
+    const nilaiTertinggi = nilai[0] || 1;
+    if (gapTerbesar > nilaiTertinggi * 0.5 && indexGapTerbesar >= 0) {
+      return indexGapTerbesar + 1; // jumlah kategori yang masuk kelompok "besar"
+    }
+    return dataUrutTerbesar.length; // tidak ada gap signifikan, semua 1 kelompok
+  }
+
+  const titikPisah = cariTitikPisahAdaptif(kategoriChartData);
+  const kelompokBesar = kategoriChartData.slice(0, titikPisah);
+  const kelompokKecil = kategoriChartData.slice(titikPisah);
+
+  /**
+   * Kirim 1 horizontal bar chart untuk sekelompok data kategori.
+   * Diekstrak jadi fungsi supaya bisa dipanggil 2x (kelompok besar &
+   * kelompok kecil) tanpa duplikasi kode.
+   */
+  async function kirimChartKategori(kelompokData, judulTambahan) {
+    if (kelompokData.length === 0) return;
+
+    // Dibalik urutannya sebelum dikirim ke chart, karena horizontal bar
+    // chart di Chart.js/QuickChart menggambar dari BAWAH ke ATAS secara
+    // default -- supaya kategori terbesar tetap muncul PALING ATAS
+    // secara visual (sesuai ekspektasi "urut dari besar").
+    const dataUntukChart = [...kelompokData].reverse();
     const labels = dataUntukChart.map((k) => k.kategori);
 
-    // Horizontal bar chart dipilih (bukan vertical) supaya nama
-    // kategori yang panjang (mis. "Kompor Import", "Antena Import")
-    // bisa dibaca penuh secara horizontal tanpa terpotong/miring, dan
-    // supaya kategori dengan volume jauh lebih besar (mis. Kipas) tidak
-    // "menenggelamkan" secara visual kategori-kategori kecil lainnya --
-    // setiap bar tetap proporsional terhadap lebar chart yang sama.
     const chartConfig = {
       type: 'horizontalBar',
       data: {
@@ -1638,20 +1686,27 @@ async function handleBanding(chatId, arg) {
         ],
       },
       options: {
-        title: { display: true, text: `Perbandingan Keluar per Kategori — ${periodA.label} vs ${periodB.label}` },
+        title: { display: true, text: `Perbandingan Keluar per Kategori${judulTambahan} — ${periodA.label} vs ${periodB.label}` },
         legend: { display: true, position: 'bottom' },
         scales: {
           xAxes: [{ ticks: { beginAtZero: true } }],
         },
       },
     };
-    // Tinggi chart menyesuaikan jumlah kategori (tiap kategori butuh
-    // ruang vertikal yang cukup untuk 2 bar + label), supaya tetap
-    // terbaca walau kategorinya banyak (14+ seperti kasus sekarang)
-    // maupun sedikit -- tidak kepepet sempit atau kosong terlalu lega.
-    const chartHeight = Math.max(400, dataUntukChart.length * 45 + 120);
+    const chartHeight = Math.max(300, dataUntukChart.length * 50 + 120);
     const chartUrl = `https://quickchart.io/chart?width=800&height=${chartHeight}&backgroundColor=white&c=${encodeURIComponent(JSON.stringify(chartConfig))}`;
-    await sendPhoto(chatId, chartUrl, `📊 Grafik ringkasan Keluar per kategori (urut terbesar) — ${periodA.label} vs ${periodB.label}`);
+    await sendPhoto(chatId, chartUrl, `📊 Grafik Keluar per kategori${judulTambahan} — ${periodA.label} vs ${periodB.label}`);
+  }
+
+  if (kelompokKecil.length === 0) {
+    // Tidak ada gap signifikan -- cukup 1 chart untuk semua kategori
+    await kirimChartKategori(kelompokBesar, ' (urut terbesar)');
+  } else {
+    // Ada gap signifikan -- pisah jadi 2 chart supaya skala masing-
+    // masing pas dengan datanya sendiri (kategori besar tidak
+    // "menenggelamkan" kategori kecil secara visual)
+    await kirimChartKategori(kelompokBesar, ' (volume besar)');
+    await kirimChartKategori(kelompokKecil, ' (volume lebih kecil)');
   }
 }
 

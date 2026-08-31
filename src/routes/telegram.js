@@ -1456,7 +1456,8 @@ async function handleBanding(chatId, arg) {
     `  ${periodA.label}: ${fmt(grandOutA)} koli`,
     `  ${periodB.label}: ${fmt(grandOutB)} koli (${hitungPersenPerubahan(grandOutA, grandOutB)})`,
     '',
-    'Breakdown lengkap per produk (urut dari Keluar paling turun) terlampir di file Excel.',
+    'Breakdown lengkap per produk (urut dari Keluar paling turun) terlampir di file Excel,',
+    'dan grafik ringkasan per kategori menyusul setelah ini.',
   ].join('\n');
   await sendMessage(chatId, summaryText);
 
@@ -1591,6 +1592,43 @@ async function handleBanding(chatId, arg) {
     `Banding ${periodA.label} vs ${periodB.label}.xlsx`,
     `Breakdown per produk per kategori, urut Keluar paling turun — ${periodA.label} vs ${periodB.label}`
   );
+
+  // Kirim juga grafik ringkasan PER KATEGORI (bukan per produk, karena
+  // bisa ratusan produk -- terlalu padat untuk 1 grafik yang terbaca)
+  // sebagai gambar terpisah via QuickChart, sama seperti /chart. Cuma
+  // kategori yang BENAR-BENAR ada transaksi (Masuk atau Keluar > 0 di
+  // salah satu bulan) yang dimasukkan -- kategori dengan total nol di
+  // kedua bulan di-skip supaya tidak ada bar kosong yang mengotori grafik.
+  const kategoriChartData = kategoriSorted
+    .map((kategori) => {
+      const groupRows = rowsByKategori.get(kategori);
+      const totalInA = groupRows.reduce((sum, r) => sum.plus(r.inA), new Prisma.Decimal(0));
+      const totalOutA = groupRows.reduce((sum, r) => sum.plus(r.outA), new Prisma.Decimal(0));
+      const totalInB = groupRows.reduce((sum, r) => sum.plus(r.inB), new Prisma.Decimal(0));
+      const totalOutB = groupRows.reduce((sum, r) => sum.plus(r.outB), new Prisma.Decimal(0));
+      return { kategori, totalInA, totalOutA, totalInB, totalOutB };
+    })
+    .filter((k) => !(k.totalInA.isZero() && k.totalOutA.isZero() && k.totalInB.isZero() && k.totalOutB.isZero()));
+
+  if (kategoriChartData.length > 0) {
+    const labels = kategoriChartData.map((k) => k.kategori);
+    const chartConfig = {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [
+          { label: `Keluar ${periodA.label}`, data: kategoriChartData.map((k) => Number(k.totalOutA)), backgroundColor: 'rgba(239, 68, 68, 0.5)' },
+          { label: `Keluar ${periodB.label}`, data: kategoriChartData.map((k) => Number(k.totalOutB)), backgroundColor: 'rgba(239, 68, 68, 0.9)' },
+        ],
+      },
+      options: {
+        title: { display: true, text: `Perbandingan Keluar per Kategori — ${periodA.label} vs ${periodB.label}` },
+        legend: { display: true },
+      },
+    };
+    const chartUrl = `https://quickchart.io/chart?width=800&height=450&backgroundColor=white&c=${encodeURIComponent(JSON.stringify(chartConfig))}`;
+    await sendPhoto(chatId, chartUrl, `📊 Grafik ringkasan Keluar per kategori — ${periodA.label} vs ${periodB.label}`);
+  }
 }
 
 
